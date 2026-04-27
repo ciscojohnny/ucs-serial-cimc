@@ -1,0 +1,19 @@
+# Session logs (auto-created by Configure-CIMC.ps1)
+logs/
+*.log
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor scratch files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# PowerShell module/dependency caches
+*.psd1.bak
+*.ps1.bak
