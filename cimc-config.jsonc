@@ -1,0 +1,141 @@
+{
+    // =========================================================================
+    //  UCS C-Series CIMC Bulk Configuration
+    //  -----------------------------------------------------------------------
+    //  This is the ONLY file you need to edit before running the script.
+    //
+    //  Quick rules for editing:
+    //      * Keep the quotes "like this" around text values.
+    //      * Use true / false (lowercase, no quotes) for on/off switches.
+    //      * Use null (no quotes) when a value is not used.
+    //      * Separate items with a comma, but NEVER put a comma after the last item.
+    //      * Anything after // on a line is a comment and is ignored.
+    //
+    //  Run the script like:
+    //      .\Configure-CIMC.ps1 -ComPort COM3 -HostName rack01-ucs01
+    //
+    //  The hostName you pass in -HostName must match an entry in "servers" below.
+    // =========================================================================
+
+
+    // -------- Networking that is the SAME for every server -------------------
+    "site": {
+        "subnetMask":     "255.255.255.0",
+        "gateway":        "10.10.20.1",
+
+        // NIC mode:        "dedicated"   |  "shared_lom"   |  "shared_lom_ext"
+        //                  "shared_lom_10g"                |  "cisco_card"
+        "nicMode":        "dedicated",
+
+        // NIC redundancy:  "none"  |  "active-standby"  |  "active-active"
+        //    Note: "active-active" is only valid with a shared_lom* NIC mode.
+        "nicRedundancy":  "none",
+
+        // Optional VLAN tag on the CIMC management port.
+        "vlanEnabled":    false,
+        "vlanId":         0,
+
+        // Olson timezone name, e.g. "America/Chicago", "Europe/London", "UTC".
+        "timezone":       "America/Chicago"
+    },
+
+
+    // -------- Intersight readiness -------------------------------------------
+    "intersight": {
+        // Enable the CIMC Device Connector so the server is ready to claim
+        // in Intersight. Leave true unless you have a reason not to.
+        "enableDeviceConnector": true,
+
+        // If the CIMC must reach Intersight through a proxy, set these.
+        // Leave them as null if no proxy is needed.
+        "proxyHost":             null,
+        "proxyPort":             null
+    },
+
+
+    // -------- CIMC admin password handling -----------------------------------
+    //  The script only ever changes the CIMC admin password when the CIMC
+    //  is still at its factory default (CIMC forces a password change on
+    //  first login). At that moment the script will prompt you on screen
+    //  for the new password. If the CIMC is already configured with a
+    //  non-default password, the script will not touch the admin password
+    //  and there are no settings to tune here.
+
+
+    // -------- Serial port settings -------------------------------------------
+    // Match these to your USB-to-serial adapter / console server. The Cisco
+    // CIMC defaults are 115200 / 8 / N / 1 with no flow control.
+    "serial": {
+        "baudRate":   115200,
+        "parity":     "None",   // "None" | "Odd" | "Even"
+        "dataBits":   8,
+        "stopBits":   "One",    // "One" | "OnePointFive" | "Two"
+        "handshake":  "None"    // "None" | "XOnXOff" | "RequestToSend"
+    },
+
+
+    // -------- Script behavior (rarely needs editing) -------------------------
+    "behavior": {
+        "commandTimeoutSec":   20,
+        "loginTimeoutSec":     60,
+        "interCommandDelayMs": 250
+    },
+
+
+    // =========================================================================
+    //  PER-SERVER ENTRIES
+    //  -----------------------------------------------------------------------
+    //  Add one { ... } block per UCS server.
+    //
+    //  To add a new server, copy an existing block and change the values.
+    //  Remember: separate blocks with a comma, but the LAST block has no
+    //  trailing comma.
+    //
+    //  Fields:
+    //    hostName       required   used with -HostName on the command line
+    //    ipAddress      required   static IPv4 for the CIMC
+    //    primaryDns     required
+    //    secondaryDns   optional   use "" if you don't have one
+    //    dnsDomain      required   e.g. "example.lab"
+    //    ntpServers     required   list of 1-4 NTP servers
+    // =========================================================================
+    "servers": [
+
+        {
+            "hostName":      "rack01-ucs01",
+            "ipAddress":     "10.10.20.51",
+            "primaryDns":    "10.10.10.10",
+            "secondaryDns":  "10.10.10.11",
+            "dnsDomain":     "example.lab",
+            "ntpServers": [
+                "ntp1.example.lab",
+                "ntp2.example.lab"
+            ]
+        },
+
+        {
+            "hostName":      "rack01-ucs02",
+            "ipAddress":     "10.10.20.52",
+            "primaryDns":    "10.10.10.10",
+            "secondaryDns":  "10.10.10.11",
+            "dnsDomain":     "example.lab",
+            "ntpServers": [
+                "ntp1.example.lab",
+                "ntp2.example.lab"
+            ]
+        },
+
+        {
+            "hostName":      "rack01-ucs03",
+            "ipAddress":     "10.10.20.53",
+            "primaryDns":    "10.10.10.10",
+            "secondaryDns":  "10.10.10.11",
+            "dnsDomain":     "example.lab",
+            "ntpServers": [
+                "ntp1.example.lab",
+                "ntp2.example.lab"
+            ]
+        }
+
+    ]
+}
