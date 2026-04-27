@@ -524,15 +524,14 @@ function Set-CimcNtp {
     # the server entries on some firmware. Enable + commit first, then load the
     # servers and commit again.
     Write-Log 'Enabling NTP service (commit #1) before configuring NTP server slots.'
-    Send-Command -Port $Port -Command 'set enabled yes' `
-        -ExpectPatterns @('#\s*$','Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+    # 'set enabled yes' on the NTP scope can prompt:
+    #   "Warning: IPMI Set SEL Time command will be disabled if NTP is enabled.
+    #    Do you wish to continue? [y/N]"
+    Invoke-CimcConfirmableCommand -Port $Port -Command 'set enabled yes' `
+        -CommandTimeoutSec $cmdTO -InterDelayMs $delayMs -Reason 'NTP set enabled yes' | Out-Null
 
-    $enableCommit = Send-Command -Port $Port -Command 'commit' `
-        -ExpectPatterns @('#\s*$','\[y/N\]') -TimeoutSec 20 -InterDelayMs $delayMs
-    if ($enableCommit -match '\[y/N\]') {
-        Send-Command -Port $Port -Command 'y' -ExpectPatterns @('#\s*$') `
-            -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-    }
+    Invoke-CimcConfirmableCommand -Port $Port -Command 'commit' `
+        -CommandTimeoutSec 20 -InterDelayMs $delayMs -Reason 'NTP enable commit' | Out-Null
 
     # Verify NTP is actually enabled before we try to load server addresses.
     $ntpStatus = Send-Command -Port $Port -Command 'show detail' `
@@ -555,12 +554,8 @@ function Set-CimcNtp {
         }
     }
 
-    $commitResp = Send-Command -Port $Port -Command 'commit' `
-        -ExpectPatterns @('#\s*$','\[y/N\]') -TimeoutSec 20 -InterDelayMs $delayMs
-    if ($commitResp -match '\[y/N\]') {
-        Send-Command -Port $Port -Command 'y' -ExpectPatterns @('#\s*$') `
-            -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-    }
+    Invoke-CimcConfirmableCommand -Port $Port -Command 'commit' `
+        -CommandTimeoutSec 20 -InterDelayMs $delayMs -Reason 'NTP servers commit' | Out-Null
 
     # Read-back so the log captures the final NTP state for forensics.
     $finalNtp = Send-Command -Port $Port -Command 'show detail' `
@@ -576,7 +571,8 @@ function Set-CimcNtp {
             Send-Command -Port $Port -Command 'scope clock' -ExpectPatterns @('#\s*$','Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
             Send-Command -Port $Port -Command ("set timezone {0}" -f $Config.site.timezone) `
                 -ExpectPatterns @('#\s*$','Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-            Send-Command -Port $Port -Command 'commit' -ExpectPatterns @('#\s*$') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+            Invoke-CimcConfirmableCommand -Port $Port -Command 'commit' `
+                -CommandTimeoutSec $cmdTO -InterDelayMs $delayMs -Reason 'timezone commit' | Out-Null
         }
     }
     Write-Log 'NTP configured.'
@@ -614,11 +610,8 @@ function Enable-IntersightDeviceConnector {
         }
     }
 
-    $commitResp = Send-Command -Port $Port -Command 'commit' -ExpectPatterns @('#\s*$','\[y/N\]') -TimeoutSec 20 -InterDelayMs $delayMs
-    if ($commitResp -match '\[y/N\]') {
-        Send-Command -Port $Port -Command 'y' -ExpectPatterns @('#\s*$') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-    }
-
+    Invoke-CimcConfirmableCommand -Port $Port -Command 'commit' `
+        -CommandTimeoutSec 20 -InterDelayMs $delayMs -Reason 'Intersight commit' | Out-Null
 }
 
 # -------------------- Inventory helpers --------------------
