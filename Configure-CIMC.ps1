@@ -245,12 +245,22 @@ function Open-CimcSerial {
         [Parameter(Mandatory)][object]$Serial
     )
 
-    $port = New-Object System.IO.Ports.SerialPort $PortName,
-        [int]$Serial.baudRate,
-        $Serial.parity,
-        [int]$Serial.dataBits,
-        $Serial.stopBits
-    $port.Handshake    = $Serial.handshake
+    # Evaluate casts in expression mode BEFORE the New-Object call. When an
+    # expression like [int]$Serial.baudRate is written directly as an argument
+    # to New-Object, PowerShell parses it in command mode and treats the
+    # leading "[int]" as part of a string token (with $Serial expanded),
+    # producing "[int]@{baudRate=115200; ...}.baudRate" which then fails to
+    # convert to Int32.
+    $baudRate  = [int]$Serial.baudRate
+    $dataBits  = [int]$Serial.dataBits
+    $parity    = [System.IO.Ports.Parity]   "$($Serial.parity)"
+    $stopBits  = [System.IO.Ports.StopBits] "$($Serial.stopBits)"
+    $handshake = [System.IO.Ports.Handshake]"$($Serial.handshake)"
+
+    $port = New-Object -TypeName System.IO.Ports.SerialPort `
+        -ArgumentList $PortName, $baudRate, $parity, $dataBits, $stopBits
+
+    $port.Handshake    = $handshake
     $port.NewLine      = "`r"
     $port.ReadTimeout  = 2000
     $port.WriteTimeout = 2000
@@ -417,7 +427,13 @@ function Set-CimcNetwork {
     if ($SecondaryDns) {
         Send-Command -Port $Port -Command "set alternate-dns-server $SecondaryDns" -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
     }
-    Send-Command -Port $Port -Command "set hostname $Hostname"                  -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+
+    # 'set hostname' on some CIMC firmware versions immediately prompts:
+    #   "Create new certificate with CN as new hostname? [y|N]"
+    # before the user even runs 'commit'. Drive that interaction here.
+    Invoke-CimcConfirmableCommand -Port $Port -Command "set hostname $Hostname" `
+        -CommandTimeoutSec $cmdTO -InterDelayMs $delayMs -Reason 'set hostname' | Out-Null
+
     Send-Command -Port $Port -Command "set domain-name $DnsDomain"              -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
 
     if ([bool]$site.vlanEnabled) {
@@ -427,34 +443,57 @@ function Set-CimcNetwork {
         Send-Command -Port $Port -Command 'set vlan-enabled no' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
     }
 
-    # Changing hostname (and sometimes the IP) triggers one or more interactive
-    # prompts on commit, including:
+    # Changing hostname (and sometimes the IP) can trigger additional interactive
+    # prompts on commit, e.g.:
     #   - "Changes will be applied. Continue? [y|N]"
     #   - "Hostname has been modified. A new certificate must be generated with
     #      the new hostname as CN. Continue? [y/N]"
-    # Loop and answer 'y' to each one until we are returned to the CLI prompt.
-    $promptRegex = 'y\|N|\[y/N\]|\[y/n\]|continue\?|regenerat.*certificate|hostname.*changed'
-    $resp = Send-Command -Port $Port -Command 'commit' `
-        -ExpectPatterns @('#\s*$', $promptRegex) `
-        -TimeoutSec 30 -InterDelayMs $delayMs
+    Invoke-CimcConfirmableCommand -Port $Port -Command 'commit' `
+        -CommandTimeoutSec 30 -InterDelayMs $delayMs -Reason 'network commit' | Out-Null
 
-    $maxConfirmations = 5
-    while ($resp -match $promptRegex -and $resp -notmatch '#\s*$' -and $maxConfirmations -gt 0) {
-        if ($resp -match 'regenerat.*certificate|hostname.*changed') {
-            Write-Log 'Hostname changed - accepting certificate regeneration prompt with new hostname as CN.'
+    Write-Log 'Network commit accepted.'
+}
+
+# Sends a command that may produce one or more interactive yes/no prompts
+# (e.g. [y|N], [y/N], "Continue?", "Create new certificate ... [y|N]") before
+# returning to the CIMC CLI '#' prompt. Answers 'y' to each prompt up to a
+# bounded number of confirmations and then returns the final response.
+function Invoke-CimcConfirmableCommand {
+    param(
+        [Parameter(Mandatory)][System.IO.Ports.SerialPort]$Port,
+        [Parameter(Mandatory)][string]$Command,
+        [Parameter(Mandatory)][int]$CommandTimeoutSec,
+        [Parameter(Mandatory)][int]$InterDelayMs,
+        [string]$Reason = 'command',
+        [int]$MaxConfirmations = 5
+    )
+
+    # Match the various confirmation prompts CIMC firmware uses. Note the
+    # literal "[y|N]" form (pipe), which is what 'set hostname' shows on the
+    # firmware that previously timed out.
+    $promptRegex = '\[y\|N\]|\[y/N\]|\[y/n\]|continue\?|regenerat.*certificate|hostname.*changed|create new certificate'
+
+    $resp = Send-Command -Port $Port -Command $Command `
+        -ExpectPatterns @('#\s*$', $promptRegex) `
+        -TimeoutSec $CommandTimeoutSec -InterDelayMs $InterDelayMs
+
+    $remaining = $MaxConfirmations
+    while ($resp -match $promptRegex -and $resp -notmatch '#\s*$' -and $remaining -gt 0) {
+        if ($resp -match 'regenerat.*certificate|hostname.*changed|create new certificate') {
+            Write-Log "$Reason - accepting certificate regeneration prompt with new hostname as CN."
         } else {
-            Write-Log 'Confirming commit prompt with "y".'
+            Write-Log "$Reason - confirming prompt with 'y'."
         }
         $resp = Send-Command -Port $Port -Command 'y' `
             -ExpectPatterns @('#\s*$', $promptRegex) `
-            -TimeoutSec 30 -InterDelayMs $delayMs
-        $maxConfirmations--
+            -TimeoutSec $CommandTimeoutSec -InterDelayMs $InterDelayMs
+        $remaining--
     }
 
     if ($resp -notmatch '#\s*$') {
-        throw "Network commit did not return to CLI prompt after answering confirmations. Last response: '$resp'"
+        throw "$Reason did not return to CLI prompt after answering confirmations. Last response: '$resp'"
     }
-    Write-Log 'Network commit accepted.'
+    return $resp
 }
 
 function Set-CimcNtp {
