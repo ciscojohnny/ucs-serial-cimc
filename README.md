@@ -95,12 +95,6 @@ in `cimc-config.jsonc` to apply.
 .\Configure-CIMC.ps1 -ComPort COM3 -HostName rack01-ucs01
 ```
 
-Use a custom config file (e.g., for a different site):
-
-```powershell
-.\Configure-CIMC.ps1 -ComPort COM3 -HostName rack01-ucs01 -ConfigPath .\site-a.jsonc
-```
-
 ## Credentials are never stored in the file
 
 When the script starts it prompts (as hidden input) for:
