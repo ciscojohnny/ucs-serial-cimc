@@ -262,21 +262,34 @@ function Open-CimcSerial {
 
     $port.Handshake    = $handshake
     $port.NewLine      = "`r"
-    $port.ReadTimeout  = 2000
+    # ReadTimeout governs how long ReadByte() blocks waiting for one byte. Keep
+    # it short so Read-Until can poll patterns frequently without spinning.
+    $port.ReadTimeout  = 200
     $port.WriteTimeout = 2000
     $port.Encoding     = [System.Text.Encoding]::ASCII
 
     # .NET's SerialPort defaults DtrEnable and RtsEnable to FALSE. Most
     # USB-to-serial adapters and the CIMC console UART will refuse to
     # transmit until the host asserts DTR (and often RTS). Terminal
-    # programs like PuTTY/Tera Term raise both automatically on connect,
-    # which is why those work and a script that does not raise them
-    # appears to "hang" with the CIMC silently sending nothing back.
+    # programs like PuTTY/Tera Term raise both automatically on connect.
     $port.DtrEnable    = $true
     $port.RtsEnable    = $true
 
     $port.Open()
+
+    # Toggle DTR off/on after open (a "drop and re-raise" pulse). PuTTY does
+    # this implicitly on connect; many devices interpret a DTR transition as
+    # "new terminal attached, reset session state and re-emit prompt." Without
+    # this pulse, a CIMC left in an odd state by a previous serial session
+    # (PuTTY closed mid-command, prior script crash, etc.) may stay silent.
+    Start-Sleep -Milliseconds 200
+    $port.DtrEnable = $false
+    $port.RtsEnable = $false
+    Start-Sleep -Milliseconds 250
+    $port.DtrEnable = $true
+    $port.RtsEnable = $true
     Start-Sleep -Milliseconds 500
+
     $port.DiscardInBuffer()
     $port.DiscardOutBuffer()
     return $port
@@ -288,27 +301,48 @@ function Read-Until {
         [Parameter(Mandatory)][string[]]$Patterns,
         [Parameter(Mandatory)][int]$TimeoutSec
     )
+
+    # Read byte-by-byte using ReadByte() with the port's own ReadTimeout.
+    #
+    # We deliberately do NOT poll BytesToRead. On several common Windows
+    # USB-to-serial drivers (FTDI, Prolific, CH340) BytesToRead can stay
+    # at 0 even when the OS already has bytes buffered for us, because the
+    # underlying driver only updates the count after a Read syscall is
+    # issued. ReadByte() always issues that syscall and respects the port's
+    # ReadTimeout, which is exactly what PuTTY does internally and is the
+    # difference between "PuTTY sees data, my script sees nothing".
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $buffer = [System.Text.StringBuilder]::new()
+    $logCursor = 0
+
     while ($sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
         try {
-            if ($Port.BytesToRead -gt 0) {
-                $chunk = $Port.ReadExisting()
-                if ($chunk) {
-                    [void]$buffer.Append($chunk)
-                    Write-Log -Level RX -Message ($chunk -replace "[`r`n]+", ' | ')
-                }
-            } else {
-                Start-Sleep -Milliseconds 100
+            $b = $Port.ReadByte()
+            if ($b -ge 0) {
+                [void]$buffer.Append([char]$b)
             }
         } catch [System.TimeoutException] {
-            Start-Sleep -Milliseconds 100
+            # No byte was available within ReadTimeout; loop and re-check
+            # patterns. This is the normal idle path.
+        } catch [System.InvalidOperationException] {
+            # Port was closed underneath us; bail out of the loop.
+            break
         }
+
+        # Log any newly-received bytes once per ReadTimeout window so the
+        # log stays readable instead of one entry per byte.
         $current = $buffer.ToString()
+        if ($current.Length -gt $logCursor) {
+            $newChunk = $current.Substring($logCursor)
+            $logCursor = $current.Length
+            Write-Log -Level RX -Message ($newChunk -replace "[`r`n]+", ' | ')
+        }
+
         foreach ($p in $Patterns) {
             if ($current -match $p) { return $current }
         }
     }
+
     $tail = $buffer.ToString()
     if ($tail.Length -gt 200) { $tail = $tail.Substring($tail.Length - 200) }
     throw "Timeout waiting for pattern(s): $($Patterns -join ', '). Last 200 chars: '$tail'"
@@ -444,10 +478,27 @@ function Set-CimcNetwork {
     Write-Log ("Configuring network: host={0} ip={1} mask={2} gw={3} dns1={4} dns2={5} domain={6}" -f `
         $Hostname, $Ip, $site.subnetMask, $site.gateway, $PrimaryDns, $SecondaryDns, $DnsDomain)
 
+    # Default ipv6Enabled to $false if the JSON does not specify it. Existing
+    # config files therefore keep working and IPv6 is disabled by default,
+    # which is what most environments running this script want.
+    $ipv6Enabled = $false
+    if ($site.PSObject.Properties.Name -contains 'ipv6Enabled' -and $null -ne $site.ipv6Enabled) {
+        $ipv6Enabled = [bool]$site.ipv6Enabled
+    }
+
     Send-Command -Port $Port -Command 'top' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
     Send-Command -Port $Port -Command 'scope cimc' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
     Send-Command -Port $Port -Command 'scope network' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
 
+    # IMPORTANT ORDERING NOTE
+    # On most CIMC firmware versions (4.x / 5.x), 'set hostname' immediately
+    # prompts to regenerate the TLS certificate, and accepting that prompt
+    # *auto-commits* every queued network change AND drops the CLI out of
+    # scope cimc/network back to /cimc#. If 'set domain-name' (or 'set
+    # ipv6-enabled') is sent AFTER 'set hostname', it either runs in the
+    # wrong scope or is silently dropped because the auto-commit already
+    # closed the change set. We therefore queue every other network setting
+    # FIRST, then run 'set hostname' last.
     Send-Command -Port $Port -Command "set dhcp-enabled no"                     -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
     Send-Command -Port $Port -Command "set dns-use-dhcp no"                     -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
     Send-Command -Port $Port -Command "set mode $($site.nicMode)"               -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
@@ -459,13 +510,6 @@ function Set-CimcNetwork {
     if ($SecondaryDns) {
         Send-Command -Port $Port -Command "set alternate-dns-server $SecondaryDns" -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
     }
-
-    # 'set hostname' on some CIMC firmware versions immediately prompts:
-    #   "Create new certificate with CN as new hostname? [y|N]"
-    # before the user even runs 'commit'. Drive that interaction here.
-    Invoke-CimcConfirmableCommand -Port $Port -Command "set hostname $Hostname" `
-        -CommandTimeoutSec $cmdTO -InterDelayMs $delayMs -Reason 'set hostname' | Out-Null
-
     Send-Command -Port $Port -Command "set domain-name $DnsDomain"              -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
 
     if ([bool]$site.vlanEnabled) {
@@ -475,6 +519,25 @@ function Set-CimcNetwork {
         Send-Command -Port $Port -Command 'set vlan-enabled no' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
     }
 
+    # Disable IPv6 on the CIMC management interface unless the operator
+    # explicitly opted in via "ipv6Enabled": true in the JSON.
+    Disable-CimcIpv6 -Port $Port -Config $Config -EnableIpv6:$ipv6Enabled
+
+    # 'set hostname' on most CIMC firmware versions prompts:
+    #   "Create new certificate with CN as new hostname? [y|N]"
+    # immediately, BEFORE 'commit'. Accepting it auto-commits all queued
+    # network changes above (which is why we queued them first).
+    Invoke-CimcConfirmableCommand -Port $Port -Command "set hostname $Hostname" `
+        -CommandTimeoutSec $cmdTO -InterDelayMs $delayMs -Reason 'set hostname' | Out-Null
+
+    # The hostname auto-commit may have dropped us out of scope cimc/network
+    # and back to /cimc# (or even /). Re-enter the network scope so the
+    # explicit 'commit' below is always run from the right place; on firmware
+    # that did NOT auto-commit, this commit picks up any remaining changes.
+    Send-Command -Port $Port -Command 'top' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+    Send-Command -Port $Port -Command 'scope cimc' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+    Send-Command -Port $Port -Command 'scope network' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+
     # Changing hostname (and sometimes the IP) can trigger additional interactive
     # prompts on commit, e.g.:
     #   - "Changes will be applied. Continue? [y|N]"
@@ -483,7 +546,67 @@ function Set-CimcNetwork {
     Invoke-CimcConfirmableCommand -Port $Port -Command 'commit' `
         -CommandTimeoutSec 30 -InterDelayMs $delayMs -Reason 'network commit' | Out-Null
 
+    # Read-back so the log captures what was actually applied. Useful when a
+    # silently-rejected setting (e.g. domain-name in the wrong scope) needs
+    # to be diagnosed after the fact.
+    $netState = Send-Command -Port $Port -Command 'show detail' `
+        -ExpectPatterns @('#\s*$') -TimeoutSec 15 -InterDelayMs $delayMs
+    Write-Log ("Post-commit /cimc/network state:`n" + $netState)
+
     Write-Log 'Network commit accepted.'
+}
+
+# Disables IPv6 on /cimc/network. CIMC firmware varies on where IPv6 lives:
+#   - 4.x / newer 5.x:  /cimc/network # set ipv6-enabled no  (then commit)
+#   - some 3.x / 4.0:   /cimc/network # scope ipv6 ; set enabled no ; commit
+# Try the flat command first; if the CIMC reports it as invalid, fall back
+# to the sub-scope form. If both forms are rejected, log a warning and move
+# on rather than failing the whole run.
+function Disable-CimcIpv6 {
+    param(
+        [Parameter(Mandatory)][System.IO.Ports.SerialPort]$Port,
+        [Parameter(Mandatory)][object]$Config,
+        [switch]$EnableIpv6
+    )
+
+    $cmdTO   = [int]$Config.behavior.commandTimeoutSec
+    $delayMs = [int]$Config.behavior.interCommandDelayMs
+
+    if ($EnableIpv6) {
+        Write-Log 'Leaving IPv6 enabled per ipv6Enabled=true in config.'
+        # We do not re-enable IPv6 here because a fresh CIMC has it on by
+        # default; only this script disables it. If you ever need to flip a
+        # disabled interface back on, do that out-of-band.
+        return
+    }
+
+    Write-Log 'Disabling IPv6 on /cimc/network.'
+
+    $resp = Send-Command -Port $Port -Command 'set ipv6-enabled no' `
+        -ExpectPatterns @('#\s*$', 'Invalid', 'No such', 'Unknown') `
+        -TimeoutSec $cmdTO -InterDelayMs $delayMs
+
+    if ($resp -match 'Invalid|No such|Unknown') {
+        Write-Log 'set ipv6-enabled not recognized; trying scope ipv6 / set enabled no fallback.'
+        $scopeResp = Send-Command -Port $Port -Command 'scope ipv6' `
+            -ExpectPatterns @('#\s*$', 'Invalid', 'No such', 'Unknown') `
+            -TimeoutSec $cmdTO -InterDelayMs $delayMs
+
+        if ($scopeResp -match 'Invalid|No such|Unknown') {
+            Write-Log -Level WARN 'CIMC firmware exposes neither set ipv6-enabled nor scope ipv6; leaving IPv6 state unchanged.'
+            return
+        }
+
+        Send-Command -Port $Port -Command 'set enabled no' `
+            -ExpectPatterns @('#\s*$', 'Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+
+        Invoke-CimcConfirmableCommand -Port $Port -Command 'commit' `
+            -CommandTimeoutSec $cmdTO -InterDelayMs $delayMs -Reason 'IPv6 disable commit' | Out-Null
+
+        # Pop back up to /cimc/network so the rest of Set-CimcNetwork keeps
+        # working in the expected scope.
+        Send-Command -Port $Port -Command 'exit' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+    }
 }
 
 # Sends a command that may produce one or more interactive yes/no prompts
