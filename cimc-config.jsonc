@@ -35,6 +35,12 @@
         "vlanEnabled":    false,
         "vlanId":         0,
 
+        // Disable IPv6 on the CIMC management interface. Most environments
+        // running this script do not use IPv6 for OOB management, so the
+        // default is false (IPv6 disabled). Set to true to leave IPv6
+        // enabled.
+        "ipv6Enabled":    false,
+
         // Olson timezone name, e.g. "America/Chicago", "Europe/London", "UTC".
         "timezone":       "America/Chicago"
     },
