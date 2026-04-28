@@ -55,6 +55,27 @@ param(
 $script:FactoryDefaultPassword = 'password'   # Cisco CIMC factory default
 $script:CimcUsername            = 'admin'     # always 'admin' for login to a factory CIMC
 
+# Regex (case-insensitive) matching the various "you must change your
+# password before continuing" prompts emitted by different CIMC firmware
+# revisions immediately after a successful login with the factory-default
+# password. Keep this list as broad as possible: missing a variant here
+# means the script silently never engages the operator and the script
+# later fails at the first '#' command.
+$script:ChangePasswordPromptRegex = '(?im)' + (@(
+    'New password:'                # 4.x / 5.x most common
+    'Enter new password:'          # some 3.x
+    'Please enter new password:'   # observed on a few C220 M5 builds
+    'Please change.*password'      # banner before the actual prompt
+    'Password must be changed'     # banner variant
+    'password is set to default'   # banner variant
+    'You are required to change'   # banner variant
+    'change your password'         # generic banner catch-all
+) -join '|')
+
+# Regex (case-insensitive) matching the confirm/retype prompt that follows
+# the first new-password entry.
+$script:ConfirmPasswordPromptRegex = '(?im)Confirm (new )?password:|Retype (new )?password:|Re[- ]?enter (new )?password:'
+
 # -------------------- Logging --------------------
 if (-not (Test-Path $LogDirectory)) {
     New-Item -ItemType Directory -Path $LogDirectory -Force | Out-Null
@@ -416,32 +437,58 @@ function Invoke-CimcLogin {
     Send-Command -Port $Port -Command $script:CimcUsername `
         -ExpectPatterns @('Password:\s*$') -TimeoutSec $loginTO -InterDelayMs $delayMs | Out-Null
 
+    # Patterns we accept after sending the password. Keep the order the same
+    # as the if/elseif checks below; the change-password regex is intentionally
+    # broad so we engage the operator on every firmware variant we have seen.
+    $postPwdPatterns = @(
+        '#\s*$',
+        '(?i)Login incorrect',
+        $script:ChangePasswordPromptRegex
+    )
+
     $pwdResp = Send-Command -Port $Port -Command $script:CimcPassword `
-        -ExpectPatterns @('#\s*$','Login incorrect','Enter new password','New password:') `
+        -ExpectPatterns $postPwdPatterns `
         -TimeoutSec $loginTO -InterDelayMs $delayMs -Sensitive
 
-    if ($pwdResp -match 'Login incorrect') {
+    if ($pwdResp -match '(?i)Login incorrect') {
         Write-Log -Level WARN 'Login incorrect with supplied password. Retrying with factory default.'
         Read-Until -Port $Port -Patterns @('login:\s*$') -TimeoutSec $loginTO | Out-Null
         Send-Command -Port $Port -Command $script:CimcUsername `
             -ExpectPatterns @('Password:\s*$') -TimeoutSec $loginTO -InterDelayMs $delayMs | Out-Null
         $pwdResp = Send-Command -Port $Port -Command $script:FactoryDefaultPassword `
-            -ExpectPatterns @('#\s*$','Login incorrect','Enter new password','New password:') `
+            -ExpectPatterns $postPwdPatterns `
             -TimeoutSec $loginTO -InterDelayMs $delayMs -Sensitive
     }
 
-    if ($pwdResp -match 'Login incorrect') {
+    if ($pwdResp -match '(?i)Login incorrect') {
         throw 'Authentication failed with both supplied and factory-default passwords.'
     }
 
-    if ($pwdResp -match 'New password:|Enter new password') {
+    # Log a tail of what CIMC actually sent after the password. This makes
+    # the "factory default detection didn't engage" failure trivial to
+    # diagnose: search the session log for "post-password tail" and you
+    # will see the exact CIMC response that needs a new prompt regex.
+    $tail = $pwdResp
+    if ($tail.Length -gt 400) { $tail = $tail.Substring($tail.Length - 400) }
+    Write-Log -Level DEBUG ("Post-password CIMC tail (last 400 chars): " + ($tail -replace "[`r`n]+", ' | '))
+
+    if ($pwdResp -match $script:ChangePasswordPromptRegex) {
         Write-Log 'Factory-default password detected. CIMC requires a new admin password before first login can complete.'
         $script:NewAdminPassword = Read-NewAdminPassword
-        Send-Command -Port $Port -Command $script:NewAdminPassword `
-            -ExpectPatterns @('Confirm password:|Retype password:|Re-enter new password:') `
-            -TimeoutSec $cmdTO -InterDelayMs $delayMs -Sensitive | Out-Null
-        Send-Command -Port $Port -Command $script:NewAdminPassword `
-            -ExpectPatterns @('#\s*$') -TimeoutSec $cmdTO -InterDelayMs $delayMs -Sensitive | Out-Null
+
+        # First entry of the new password: expect either a confirm prompt or
+        # the # prompt directly (some firmware skips the confirm step).
+        $confirmResp = Send-Command -Port $Port -Command $script:NewAdminPassword `
+            -ExpectPatterns @($script:ConfirmPasswordPromptRegex, '#\s*$') `
+            -TimeoutSec $cmdTO -InterDelayMs $delayMs -Sensitive
+
+        if ($confirmResp -notmatch '#\s*$') {
+            # Confirm prompt was shown: send the new password again.
+            Send-Command -Port $Port -Command $script:NewAdminPassword `
+                -ExpectPatterns @('#\s*$', '(?i)Login incorrect', '(?i)password.*mismatch', '(?i)passwords do not match') `
+                -TimeoutSec $cmdTO -InterDelayMs $delayMs -Sensitive | Out-Null
+        }
+
         $script:CimcPassword = $script:NewAdminPassword
         Write-Log 'New admin password accepted by CIMC.'
     }
