@@ -265,8 +265,18 @@ function Open-CimcSerial {
     $port.ReadTimeout  = 2000
     $port.WriteTimeout = 2000
     $port.Encoding     = [System.Text.Encoding]::ASCII
+
+    # .NET's SerialPort defaults DtrEnable and RtsEnable to FALSE. Most
+    # USB-to-serial adapters and the CIMC console UART will refuse to
+    # transmit until the host asserts DTR (and often RTS). Terminal
+    # programs like PuTTY/Tera Term raise both automatically on connect,
+    # which is why those work and a script that does not raise them
+    # appears to "hang" with the CIMC silently sending nothing back.
+    $port.DtrEnable    = $true
+    $port.RtsEnable    = $true
+
     $port.Open()
-    Start-Sleep -Milliseconds 250
+    Start-Sleep -Milliseconds 500
     $port.DiscardInBuffer()
     $port.DiscardOutBuffer()
     return $port
@@ -332,10 +342,32 @@ function Invoke-CimcLogin {
     $delayMs  = [int]$Behavior.interCommandDelayMs
 
     Write-Log 'Probing CIMC prompt...'
-    $Port.WriteLine(''); Start-Sleep -Milliseconds 500
-    $Port.WriteLine(''); Start-Sleep -Milliseconds 500
 
-    $resp = Read-Until -Port $Port -Patterns @('login:\s*$','Password:\s*$','#\s*$') -TimeoutSec $loginTO
+    # Send several CRs spaced out and listen between each one. This handles
+    # three real-world states the CIMC may be in when the script attaches:
+    #   - sitting at "login:"          -> CR redraws the prompt
+    #   - mid-banner / mid-boot output -> CR is a no-op until login appears
+    #   - already logged in at "#"     -> CR redraws the # prompt
+    # If a previous terminal session (PuTTY/Tera Term) just closed, the CIMC
+    # may need a moment to re-arm DSR/DTR before it transmits anything.
+    $resp = ''
+    $probeAttempts = 6
+    for ($i = 1; $i -le $probeAttempts; $i++) {
+        try { $Port.WriteLine('') } catch { Write-Log -Level WARN "Probe write failed (attempt $i): $($_.Exception.Message)" }
+        Start-Sleep -Milliseconds 750
+        try {
+            $resp = Read-Until -Port $Port -Patterns @('login:\s*$','Password:\s*$','#\s*$') -TimeoutSec 5
+            break
+        } catch {
+            if ($i -eq $probeAttempts) {
+                throw ("CIMC did not respond on $($Port.PortName) after $probeAttempts probe attempts. " +
+                       'Verify: (1) the cable is in the CIMC console port (not the host serial port), ' +
+                       '(2) any other terminal program (PuTTY/Tera Term) is fully closed, ' +
+                       '(3) serial settings match 115200/8/N/1 with no flow control, and ' +
+                       '(4) try unplugging and reconnecting the USB-to-serial adapter.')
+            }
+        }
+    }
 
     if ($resp -match '#\s*$') {
         Write-Log 'Already at CIMC CLI prompt (session inherited).'
