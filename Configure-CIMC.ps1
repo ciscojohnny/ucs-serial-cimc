@@ -55,27 +55,6 @@ param(
 $script:FactoryDefaultPassword = 'password'   # Cisco CIMC factory default
 $script:CimcUsername            = 'admin'     # always 'admin' for login to a factory CIMC
 
-# Regex (case-insensitive) matching the various "you must change your
-# password before continuing" prompts emitted by different CIMC firmware
-# revisions immediately after a successful login with the factory-default
-# password. Keep this list as broad as possible: missing a variant here
-# means the script silently never engages the operator and the script
-# later fails at the first '#' command.
-$script:ChangePasswordPromptRegex = '(?im)' + (@(
-    'New password:'                # 4.x / 5.x most common
-    'Enter new password:'          # some 3.x
-    'Please enter new password:'   # observed on a few C220 M5 builds
-    'Please change.*password'      # banner before the actual prompt
-    'Password must be changed'     # banner variant
-    'password is set to default'   # banner variant
-    'You are required to change'   # banner variant
-    'change your password'         # generic banner catch-all
-) -join '|')
-
-# Regex (case-insensitive) matching the confirm/retype prompt that follows
-# the first new-password entry.
-$script:ConfirmPasswordPromptRegex = '(?im)Confirm (new )?password:|Retype (new )?password:|Re[- ]?enter (new )?password:'
-
 # -------------------- Logging --------------------
 if (-not (Test-Path $LogDirectory)) {
     New-Item -ItemType Directory -Path $LogDirectory -Force | Out-Null
@@ -266,54 +245,50 @@ function Open-CimcSerial {
         [Parameter(Mandatory)][object]$Serial
     )
 
-    # Evaluate casts in expression mode BEFORE the New-Object call. When an
-    # expression like [int]$Serial.baudRate is written directly as an argument
-    # to New-Object, PowerShell parses it in command mode and treats the
-    # leading "[int]" as part of a string token (with $Serial expanded),
-    # producing "[int]@{baudRate=115200; ...}.baudRate" which then fails to
-    # convert to Int32.
-    $baudRate  = [int]$Serial.baudRate
-    $dataBits  = [int]$Serial.dataBits
-    $parity    = [System.IO.Ports.Parity]   "$($Serial.parity)"
-    $stopBits  = [System.IO.Ports.StopBits] "$($Serial.stopBits)"
-    $handshake = [System.IO.Ports.Handshake]"$($Serial.handshake)"
-
-    $port = New-Object -TypeName System.IO.Ports.SerialPort `
-        -ArgumentList $PortName, $baudRate, $parity, $dataBits, $stopBits
-
-    $port.Handshake    = $handshake
+    $port = [System.IO.Ports.SerialPort]::new(
+        $PortName,
+        [int]$Serial.baudRate,
+        [System.IO.Ports.Parity]$Serial.parity,
+        [int]$Serial.dataBits,
+        [System.IO.Ports.StopBits]$Serial.stopBits
+    )
+    $port.Handshake    = [System.IO.Ports.Handshake]$Serial.handshake
     $port.NewLine      = "`r"
-    # ReadTimeout governs how long ReadByte() blocks waiting for one byte. Keep
-    # it short so Read-Until can poll patterns frequently without spinning.
-    $port.ReadTimeout  = 200
+    $port.ReadTimeout  = 2000
     $port.WriteTimeout = 2000
     $port.Encoding     = [System.Text.Encoding]::ASCII
-
-    # .NET's SerialPort defaults DtrEnable and RtsEnable to FALSE. Most
-    # USB-to-serial adapters and the CIMC console UART will refuse to
-    # transmit until the host asserts DTR (and often RTS). Terminal
-    # programs like PuTTY/Tera Term raise both automatically on connect.
+    # Assert DTR/RTS before opening. The Cisco serial console and many USB-serial
+    # adapters (e.g. Prolific PL2303) require these control lines high before they
+    # will send/receive data; without them a fresh console stays completely silent.
     $port.DtrEnable    = $true
     $port.RtsEnable    = $true
-
     $port.Open()
-
-    # Toggle DTR off/on after open (a "drop and re-raise" pulse). PuTTY does
-    # this implicitly on connect; many devices interpret a DTR transition as
-    # "new terminal attached, reset session state and re-emit prompt." Without
-    # this pulse, a CIMC left in an odd state by a previous serial session
-    # (PuTTY closed mid-command, prior script crash, etc.) may stay silent.
-    Start-Sleep -Milliseconds 200
-    $port.DtrEnable = $false
-    $port.RtsEnable = $false
     Start-Sleep -Milliseconds 250
-    $port.DtrEnable = $true
-    $port.RtsEnable = $true
-    Start-Sleep -Milliseconds 500
-
     $port.DiscardInBuffer()
     $port.DiscardOutBuffer()
     return $port
+}
+
+function Reset-CimcPort {
+    # Perform a TRUE drop/reconnect: fully dispose the serial port (releasing the
+    # OS handle) and create a brand-new one. After the CIMC management console
+    # resets (first-time password change, reboot/factory reset) it stays mute
+    # until the serial connection is actually dropped and reopened - exactly what
+    # SecureCRT/screen or a fresh process does. A same-object Close()/Open() does
+    # NOT reliably toggle DTR/RTS at the driver level on macOS, so we recreate
+    # the object. Returns the new port (also stored in $script:Port), or $null if
+    # the reopen failed (caller should retry).
+    param([Parameter(Mandatory)][AllowNull()][System.IO.Ports.SerialPort]$Port)
+    try { if ($Port -and $Port.IsOpen) { $Port.Close() } } catch {}
+    try { if ($Port) { $Port.Dispose() } } catch {}
+    Start-Sleep -Milliseconds 1200
+    try {
+        $new = Open-CimcSerial -PortName $script:PortName -Serial $script:SerialConfig
+        $script:Port = $new
+        return $new
+    } catch {
+        return $null
+    }
 }
 
 function Read-Until {
@@ -322,48 +297,27 @@ function Read-Until {
         [Parameter(Mandatory)][string[]]$Patterns,
         [Parameter(Mandatory)][int]$TimeoutSec
     )
-
-    # Read byte-by-byte using ReadByte() with the port's own ReadTimeout.
-    #
-    # We deliberately do NOT poll BytesToRead. On several common Windows
-    # USB-to-serial drivers (FTDI, Prolific, CH340) BytesToRead can stay
-    # at 0 even when the OS already has bytes buffered for us, because the
-    # underlying driver only updates the count after a Read syscall is
-    # issued. ReadByte() always issues that syscall and respects the port's
-    # ReadTimeout, which is exactly what PuTTY does internally and is the
-    # difference between "PuTTY sees data, my script sees nothing".
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $buffer = [System.Text.StringBuilder]::new()
-    $logCursor = 0
-
     while ($sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
         try {
-            $b = $Port.ReadByte()
-            if ($b -ge 0) {
-                [void]$buffer.Append([char]$b)
+            if ($Port.BytesToRead -gt 0) {
+                $chunk = $Port.ReadExisting()
+                if ($chunk) {
+                    [void]$buffer.Append($chunk)
+                    Write-Log -Level RX -Message ($chunk -replace "[`r`n]+", ' | ')
+                }
+            } else {
+                Start-Sleep -Milliseconds 100
             }
         } catch [System.TimeoutException] {
-            # No byte was available within ReadTimeout; loop and re-check
-            # patterns. This is the normal idle path.
-        } catch [System.InvalidOperationException] {
-            # Port was closed underneath us; bail out of the loop.
-            break
+            Start-Sleep -Milliseconds 100
         }
-
-        # Log any newly-received bytes once per ReadTimeout window so the
-        # log stays readable instead of one entry per byte.
         $current = $buffer.ToString()
-        if ($current.Length -gt $logCursor) {
-            $newChunk = $current.Substring($logCursor)
-            $logCursor = $current.Length
-            Write-Log -Level RX -Message ($newChunk -replace "[`r`n]+", ' | ')
-        }
-
         foreach ($p in $Patterns) {
             if ($current -match $p) { return $current }
         }
     }
-
     $tail = $buffer.ToString()
     if ($tail.Length -gt 200) { $tail = $tail.Substring($tail.Length - 200) }
     throw "Timeout waiting for pattern(s): $($Patterns -join ', '). Last 200 chars: '$tail'"
@@ -386,6 +340,185 @@ function Send-Command {
 }
 
 # -------------------- Login / Logout --------------------
+# -------------------- Prompt patterns (CIMC serial console) --------------------
+# Centralised so the login probe and the password-change handler stay in sync.
+# Observed M7 wording (CIMC 4.x/5.x):
+#   "[<host>] Username:"            login prompt (NOT "login:")
+#   "Password:"                     password prompt
+#   "Enter current password:"       forced-change step 1
+#   "Enter new password:"           forced-change step 2
+#   "Re-enter new password:"        forced-change step 3
+# NOTE: "Re-enter new password:" also contains "new password:", so callers MUST
+#       test $script:RxConfirmPwd BEFORE $script:RxNewPwd to disambiguate.
+$script:RxUser       = '(?i)(?:Username|login):\s*$'
+$script:RxPass       = '(?i)Password:\s*$'
+$script:RxCli        = '#\s*$'
+$script:RxCurrentPwd = '(?i)current password:\s*$'
+$script:RxNewPwd     = '(?i)new password:\s*$'
+$script:RxConfirmPwd = '(?i)(?:re-?enter|re-?type|confirm)[^\r\n]*password:\s*$'
+$script:RxLoginFail  = '(?i)(login incorrect|permission denied|authentication fail|does not match|password mismatch|invalid password)'
+
+# Interactive confirmation prompts CIMC can raise after a 'set'/'commit'
+# (e.g. "Do you wish to continue? [y/N]", certificate regeneration). Kept here
+# so every call site answers them the same way.
+$script:RxConfirm = 'y\|N|\[y/N\]|\[y/n\]|continue\?|certificate'
+
+function Send-CimcConfirm {
+    <#
+        Send a command and automatically answer any interactive confirmation
+        prompt(s) by replying 'y' until the CLI prompt (#) returns. Use this for
+        any command that may pop a "[y/N]" confirmation. Returns the final
+        accumulated console text.
+    #>
+    param(
+        [Parameter(Mandatory)][System.IO.Ports.SerialPort]$Port,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Command,
+        [int]$TimeoutSec = 20,
+        [int]$InterDelayMs = 250,
+        [int]$MaxConfirm = 5,
+        [switch]$Sensitive
+    )
+    $resp = Send-Command -Port $Port -Command $Command `
+        -ExpectPatterns @($script:RxCli, $script:RxConfirm) `
+        -TimeoutSec $TimeoutSec -InterDelayMs $InterDelayMs -Sensitive:$Sensitive
+    $n = $MaxConfirm
+    while ($resp -match $script:RxConfirm -and $resp -notmatch $script:RxCli -and $n -gt 0) {
+        Write-Log 'Auto-confirming CIMC prompt with "y".'
+        $resp = Send-Command -Port $Port -Command 'y' `
+            -ExpectPatterns @($script:RxCli, $script:RxConfirm) `
+            -TimeoutSec $TimeoutSec -InterDelayMs $InterDelayMs
+        $n--
+    }
+    return $resp
+}
+
+function Invoke-PasswordChange {
+    <#
+        Drives the CIMC forced password-change dialog. Can be entered either
+        right after sending the login password, or when the console is already
+        parked somewhere inside the dialog (StartResp tells us where).
+    #>
+    param(
+        [Parameter(Mandatory)][System.IO.Ports.SerialPort]$Port,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$CurrentPwd,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$StartResp,
+        [Parameter(Mandatory)][object]$Behavior
+    )
+
+    $cmdTO   = [int]$Behavior.commandTimeoutSec
+    $delayMs = [int]$Behavior.interCommandDelayMs
+    $resp    = $StartResp
+
+    # Step 1: "Enter current password:" -> resend the current/default password.
+    if ($resp -match $script:RxCurrentPwd) {
+        Write-Log 'Password change: supplying current password.'
+        $resp = Send-Command -Port $Port -Command $CurrentPwd `
+            -ExpectPatterns @($script:RxConfirmPwd, $script:RxNewPwd, $script:RxCli, $script:RxLoginFail) `
+            -TimeoutSec $cmdTO -InterDelayMs $delayMs -Sensitive
+        if ($resp -match $script:RxLoginFail -and $resp -notmatch $script:RxNewPwd) {
+            throw 'CIMC rejected the current password during the forced password change.'
+        }
+    }
+
+    # Collect (and validate) the new admin password from the operator.
+    $newPwd = Read-NewAdminPassword
+
+    # Step 2: "Enter new password:" -> send the new password.
+    if ($resp -notmatch $script:RxNewPwd -or $resp -match $script:RxConfirmPwd) {
+        $resp = Read-Until -Port $Port -Patterns @($script:RxNewPwd, $script:RxConfirmPwd) -TimeoutSec $cmdTO
+    }
+    if ($resp -notmatch $script:RxConfirmPwd) {
+        $resp = Send-Command -Port $Port -Command $newPwd `
+            -ExpectPatterns @($script:RxConfirmPwd, $script:RxCli, $script:RxLoginFail) `
+            -TimeoutSec $cmdTO -InterDelayMs $delayMs -Sensitive
+    }
+
+    # Step 3: "Re-enter new password:" -> confirm the new password.
+    # On this firmware a first-time password change takes the management console
+    # FULLY OFFLINE for several minutes (observed ~5 min) while the BMC applies
+    # the change/restarts. When it returns it sits at the login prompt but will
+    # NOT reprint "Username:" on a bare Enter, so we must speculatively send the
+    # username to elicit "Password:" and then log in with the NEW password.
+    if ($resp -match $script:RxConfirmPwd) {
+        $Port.WriteLine($newPwd)
+        Start-Sleep -Milliseconds $delayMs
+
+        $script:CimcPassword     = $newPwd
+        $script:NewAdminPassword = $newPwd
+
+        Write-Log 'New password submitted. CIMC takes the console offline for several minutes after a first-time change; waiting for it to recover and re-login...'
+
+        $recoverTO = 600   # seconds (10 min) - observed ~5 min recovery
+        $loggedIn  = $false
+        $waited    = [System.Diagnostics.Stopwatch]::StartNew()
+        while (-not $loggedIn -and $waited.Elapsed.TotalSeconds -lt $recoverTO) {
+            Start-Sleep -Seconds 10
+
+            # The console only resumes after a true drop/reconnect, so recreate
+            # the port each attempt.
+            $Port = Reset-CimcPort -Port $Port
+            if (-not $Port) { continue }
+            try { $Port.Write("`r"); Start-Sleep -Milliseconds 400; $Port.DiscardInBuffer() } catch { continue }
+
+            # Speculatively send the username; a live console answers "Password:".
+            $uResp = $null
+            try {
+                $uResp = Send-Command -Port $Port -Command $script:CimcUsername `
+                    -ExpectPatterns @($script:RxPass, $script:RxCli) -TimeoutSec 6 -InterDelayMs $delayMs
+            }
+            catch {
+                $secs = [int]$waited.Elapsed.TotalSeconds
+                Write-Log "Console still offline after the password change (${secs}s elapsed); continuing to wait..."
+                continue
+            }
+
+            if ($uResp -match $script:RxCli) { $loggedIn = $true; break }
+
+            if ($uResp -match $script:RxPass) {
+                $pResp = Send-Command -Port $Port -Command $newPwd `
+                    -ExpectPatterns @($script:RxCli, $script:RxLoginFail, $script:RxCurrentPwd, $script:RxNewPwd) `
+                    -TimeoutSec 15 -InterDelayMs $delayMs -Sensitive
+                if ($pResp -match $script:RxCli) { $loggedIn = $true; break }
+                if ($pResp -match $script:RxLoginFail) {
+                    throw 'Re-login after the password change failed: the new password was not accepted.'
+                }
+                if ($pResp -match $script:RxCurrentPwd -or $pResp -match $script:RxNewPwd) {
+                    throw 'CIMC re-prompted for a password change after the new password was submitted (change may not have applied).'
+                }
+            }
+        }
+
+        if (-not $loggedIn) {
+            throw "CIMC console did not recover within ${recoverTO}s after the password change."
+        }
+
+        Write-Log 'Re-login after the password change succeeded. New admin password accepted by CIMC.'
+        return
+    }
+
+    # Fallback: we never reached the confirm prompt (unexpected dialog shape).
+    if ($resp -match $script:RxLoginFail -or $resp -match $script:RxNewPwd) {
+        throw 'Password change failed (CIMC rejected the new password - likely a strong-password policy violation or mismatch). Try again.'
+    }
+
+    $script:CimcPassword     = $newPwd
+    $script:NewAdminPassword = $newPwd
+
+    if ($resp -match $script:RxUser) {
+        Write-Log 'CIMC requires re-login after the password change; logging in with the new password.'
+        Send-Command -Port $Port -Command $script:CimcUsername `
+            -ExpectPatterns @($script:RxPass) -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+        Send-Command -Port $Port -Command $newPwd `
+            -ExpectPatterns @($script:RxCli, $script:RxLoginFail) -TimeoutSec $cmdTO -InterDelayMs $delayMs -Sensitive | Out-Null
+    }
+    elseif ($resp -notmatch $script:RxCli) {
+        Send-Command -Port $Port -Command '' `
+            -ExpectPatterns @($script:RxCli, $script:RxUser) -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+    }
+
+    Write-Log 'New admin password accepted by CIMC.'
+}
+
 function Invoke-CimcLogin {
     param(
         [Parameter(Mandatory)][System.IO.Ports.SerialPort]$Port,
@@ -393,104 +526,105 @@ function Invoke-CimcLogin {
     )
 
     $loginTO  = [int]$Behavior.loginTimeoutSec
-    $cmdTO    = [int]$Behavior.commandTimeoutSec
     $delayMs  = [int]$Behavior.interCommandDelayMs
 
     Write-Log 'Probing CIMC prompt...'
 
-    # Send several CRs spaced out and listen between each one. This handles
-    # three real-world states the CIMC may be in when the script attaches:
-    #   - sitting at "login:"          -> CR redraws the prompt
-    #   - mid-banner / mid-boot output -> CR is a no-op until login appears
-    #   - already logged in at "#"     -> CR redraws the # prompt
-    # If a previous terminal session (PuTTY/Tera Term) just closed, the CIMC
-    # may need a moment to re-arm DSR/DTR before it transmits anything.
-    $resp = ''
-    $probeAttempts = 6
-    for ($i = 1; $i -le $probeAttempts; $i++) {
-        try { $Port.WriteLine('') } catch { Write-Log -Level WARN "Probe write failed (attempt $i): $($_.Exception.Message)" }
-        Start-Sleep -Milliseconds 750
+    # The console may be OFFLINE (still booting after a factory reset/reboot - can
+    # take several minutes) or parked at a login prompt that will NOT reprint
+    # "Username:" on a bare Enter. Patiently establish a known state: detect the
+    # CLI (#) or a password-change prompt, or get to "Password:" by speculatively
+    # sending the username. Retry for several minutes to ride through a booting
+    # console instead of failing on the first silent attempt.
+    $bootTO    = [Math]::Max($loginTO, 600)
+    $atPass    = $false
+    $waited     = [System.Diagnostics.Stopwatch]::StartNew()
+    $firstPass  = $true
+    while (-not $atPass -and $waited.Elapsed.TotalSeconds -lt $bootTO) {
+        if (-not $firstPass) {
+            Start-Sleep -Seconds 10
+            # The console only resumes after a true drop/reconnect, so recreate
+            # the port before each retry.
+            $Port = Reset-CimcPort -Port $Port
+            if (-not $Port) { continue }
+        }
+        $firstPass = $false
+
+        try { $Port.DiscardInBuffer() } catch {}
+        $Port.Write("`r"); Start-Sleep -Milliseconds 400
+        try { $Port.DiscardInBuffer() } catch {}
+
+        # See if the console volunteers a recognizable prompt first.
+        $resp = ''
         try {
-            $resp = Read-Until -Port $Port -Patterns @('login:\s*$','Password:\s*$','#\s*$') -TimeoutSec 5
-            break
-        } catch {
-            if ($i -eq $probeAttempts) {
-                throw ("CIMC did not respond on $($Port.PortName) after $probeAttempts probe attempts. " +
-                       'Verify: (1) the cable is in the CIMC console port (not the host serial port), ' +
-                       '(2) any other terminal program (PuTTY/Tera Term) is fully closed, ' +
-                       '(3) serial settings match 115200/8/N/1 with no flow control, and ' +
-                       '(4) try unplugging and reconnecting the USB-to-serial adapter.')
-            }
+            $resp = Read-Until -Port $Port `
+                -Patterns @($script:RxUser, $script:RxPass, $script:RxCli, $script:RxCurrentPwd, $script:RxConfirmPwd, $script:RxNewPwd) `
+                -TimeoutSec 4
+        } catch { $resp = '' }
+
+        if ($resp -match $script:RxCli) {
+            Write-Log 'Already at CIMC CLI prompt (session inherited).'
+            return
+        }
+
+        # Console parked mid password-change dialog (e.g. from a prior attempt):
+        # finish the change. Test confirm before new because "Re-enter new
+        # password:" also matches the new-password pattern.
+        if ($resp -match $script:RxCurrentPwd -or $resp -match $script:RxConfirmPwd -or $resp -match $script:RxNewPwd) {
+            Write-Log 'Console is parked at a password-change prompt; completing the password change.'
+            Invoke-PasswordChange -Port $Port -CurrentPwd $script:CimcPassword -StartResp $resp -Behavior $Behavior
+            Write-Log 'CIMC login successful (completed a pending password change).'
+            return
+        }
+
+        # Speculatively send the username; a live login console answers "Password:".
+        $uResp = ''
+        try {
+            $uResp = Send-Command -Port $Port -Command $script:CimcUsername `
+                -ExpectPatterns @($script:RxPass, $script:RxCli) -TimeoutSec 6 -InterDelayMs $delayMs
+        }
+        catch {
+            $secs = [int]$waited.Elapsed.TotalSeconds
+            Write-Log "Console not responding yet (${secs}s elapsed); waiting (CIMC may still be booting)..."
+            continue
+        }
+
+        if ($uResp -match $script:RxCli) {
+            Write-Log 'Already at CIMC CLI prompt (session inherited).'
+            return
+        }
+        if ($uResp -match $script:RxPass) { $atPass = $true; break }
+    }
+
+    if (-not $atPass) {
+        throw "CIMC console did not present a login prompt within ${bootTO}s (still offline/booting?)."
+    }
+
+    # We are at "Password:" - send the password.
+    $pwdResp = Send-Command -Port $Port -Command $script:CimcPassword `
+        -ExpectPatterns @($script:RxCli, $script:RxLoginFail, $script:RxCurrentPwd, $script:RxNewPwd) `
+        -TimeoutSec $loginTO -InterDelayMs $delayMs -Sensitive
+
+    if ($pwdResp -match $script:RxLoginFail) {
+        Write-Log -Level WARN 'Login incorrect with supplied password. Retrying with factory default.'
+        Read-Until -Port $Port -Patterns @($script:RxUser) -TimeoutSec $loginTO | Out-Null
+        Send-Command -Port $Port -Command $script:CimcUsername `
+            -ExpectPatterns @($script:RxPass) -TimeoutSec $loginTO -InterDelayMs $delayMs | Out-Null
+        $pwdResp = Send-Command -Port $Port -Command $script:FactoryDefaultPassword `
+            -ExpectPatterns @($script:RxCli, $script:RxLoginFail, $script:RxCurrentPwd, $script:RxNewPwd) `
+            -TimeoutSec $loginTO -InterDelayMs $delayMs -Sensitive
+        if ($pwdResp -notmatch $script:RxLoginFail) {
+            $script:CimcPassword = $script:FactoryDefaultPassword
         }
     }
 
-    if ($resp -match '#\s*$') {
-        Write-Log 'Already at CIMC CLI prompt (session inherited).'
-        return
-    }
-
-    if ($resp -match 'Password:\s*$') {
-        $Port.WriteLine('')
-        $resp = Read-Until -Port $Port -Patterns @('login:\s*$') -TimeoutSec $loginTO
-    }
-
-    Send-Command -Port $Port -Command $script:CimcUsername `
-        -ExpectPatterns @('Password:\s*$') -TimeoutSec $loginTO -InterDelayMs $delayMs | Out-Null
-
-    # Patterns we accept after sending the password. Keep the order the same
-    # as the if/elseif checks below; the change-password regex is intentionally
-    # broad so we engage the operator on every firmware variant we have seen.
-    $postPwdPatterns = @(
-        '#\s*$',
-        '(?i)Login incorrect',
-        $script:ChangePasswordPromptRegex
-    )
-
-    $pwdResp = Send-Command -Port $Port -Command $script:CimcPassword `
-        -ExpectPatterns $postPwdPatterns `
-        -TimeoutSec $loginTO -InterDelayMs $delayMs -Sensitive
-
-    if ($pwdResp -match '(?i)Login incorrect') {
-        Write-Log -Level WARN 'Login incorrect with supplied password. Retrying with factory default.'
-        Read-Until -Port $Port -Patterns @('login:\s*$') -TimeoutSec $loginTO | Out-Null
-        Send-Command -Port $Port -Command $script:CimcUsername `
-            -ExpectPatterns @('Password:\s*$') -TimeoutSec $loginTO -InterDelayMs $delayMs | Out-Null
-        $pwdResp = Send-Command -Port $Port -Command $script:FactoryDefaultPassword `
-            -ExpectPatterns $postPwdPatterns `
-            -TimeoutSec $loginTO -InterDelayMs $delayMs -Sensitive
-    }
-
-    if ($pwdResp -match '(?i)Login incorrect') {
+    if ($pwdResp -match $script:RxLoginFail) {
         throw 'Authentication failed with both supplied and factory-default passwords.'
     }
 
-    # Log a tail of what CIMC actually sent after the password. This makes
-    # the "factory default detection didn't engage" failure trivial to
-    # diagnose: search the session log for "post-password tail" and you
-    # will see the exact CIMC response that needs a new prompt regex.
-    $tail = $pwdResp
-    if ($tail.Length -gt 400) { $tail = $tail.Substring($tail.Length - 400) }
-    Write-Log -Level DEBUG ("Post-password CIMC tail (last 400 chars): " + ($tail -replace "[`r`n]+", ' | '))
-
-    if ($pwdResp -match $script:ChangePasswordPromptRegex) {
-        Write-Log 'Factory-default password detected. CIMC requires a new admin password before first login can complete.'
-        $script:NewAdminPassword = Read-NewAdminPassword
-
-        # First entry of the new password: expect either a confirm prompt or
-        # the # prompt directly (some firmware skips the confirm step).
-        $confirmResp = Send-Command -Port $Port -Command $script:NewAdminPassword `
-            -ExpectPatterns @($script:ConfirmPasswordPromptRegex, '#\s*$') `
-            -TimeoutSec $cmdTO -InterDelayMs $delayMs -Sensitive
-
-        if ($confirmResp -notmatch '#\s*$') {
-            # Confirm prompt was shown: send the new password again.
-            Send-Command -Port $Port -Command $script:NewAdminPassword `
-                -ExpectPatterns @('#\s*$', '(?i)Login incorrect', '(?i)password.*mismatch', '(?i)passwords do not match') `
-                -TimeoutSec $cmdTO -InterDelayMs $delayMs -Sensitive | Out-Null
-        }
-
-        $script:CimcPassword = $script:NewAdminPassword
-        Write-Log 'New admin password accepted by CIMC.'
+    if ($pwdResp -match $script:RxCurrentPwd -or $pwdResp -match $script:RxNewPwd) {
+        Write-Log 'Factory-default password detected. CIMC requires an admin password change before first login can complete.'
+        Invoke-PasswordChange -Port $Port -CurrentPwd $script:CimcPassword -StartResp $pwdResp -Behavior $Behavior
     }
 
     Write-Log 'CIMC login successful.'
@@ -522,30 +656,18 @@ function Set-CimcNetwork {
     $cmdTO   = [int]$Config.behavior.commandTimeoutSec
     $delayMs = [int]$Config.behavior.interCommandDelayMs
 
+    # Interactive [y|N] confirmations that CIMC can raise either right after a
+    # command (e.g. "set hostname" -> "Create new certificate ... [y|N]") or at
+    # commit time. Matched in one place so both call sites stay consistent.
+    $promptRegex = 'y\|N|\[y/N\]|\[y/n\]|continue\?|certificate|hostname.*changed'
+
     Write-Log ("Configuring network: host={0} ip={1} mask={2} gw={3} dns1={4} dns2={5} domain={6}" -f `
         $Hostname, $Ip, $site.subnetMask, $site.gateway, $PrimaryDns, $SecondaryDns, $DnsDomain)
-
-    # Default ipv6Enabled to $false if the JSON does not specify it. Existing
-    # config files therefore keep working and IPv6 is disabled by default,
-    # which is what most environments running this script want.
-    $ipv6Enabled = $false
-    if ($site.PSObject.Properties.Name -contains 'ipv6Enabled' -and $null -ne $site.ipv6Enabled) {
-        $ipv6Enabled = [bool]$site.ipv6Enabled
-    }
 
     Send-Command -Port $Port -Command 'top' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
     Send-Command -Port $Port -Command 'scope cimc' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
     Send-Command -Port $Port -Command 'scope network' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
 
-    # IMPORTANT ORDERING NOTE
-    # On most CIMC firmware versions (4.x / 5.x), 'set hostname' immediately
-    # prompts to regenerate the TLS certificate, and accepting that prompt
-    # *auto-commits* every queued network change AND drops the CLI out of
-    # scope cimc/network back to /cimc#. If 'set domain-name' (or 'set
-    # ipv6-enabled') is sent AFTER 'set hostname', it either runs in the
-    # wrong scope or is silently dropped because the auto-commit already
-    # closed the change set. We therefore queue every other network setting
-    # FIRST, then run 'set hostname' last.
     Send-Command -Port $Port -Command "set dhcp-enabled no"                     -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
     Send-Command -Port $Port -Command "set dns-use-dhcp no"                     -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
     Send-Command -Port $Port -Command "set mode $($site.nicMode)"               -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
@@ -557,7 +679,30 @@ function Set-CimcNetwork {
     if ($SecondaryDns) {
         Send-Command -Port $Port -Command "set alternate-dns-server $SecondaryDns" -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
     }
-    Send-Command -Port $Port -Command "set domain-name $DnsDomain"              -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+    # On some firmware "set hostname" immediately prompts:
+    #   "Create new certificate with CN as new hostname? [y|N]"
+    # Answer 'y' to any such prompt(s) before continuing. Use a longer timeout
+    # because accepting can trigger certificate regeneration.
+    $hostResp = Send-Command -Port $Port -Command "set hostname $Hostname" `
+        -ExpectPatterns @('#\s*$', $promptRegex) -TimeoutSec $cmdTO -InterDelayMs $delayMs
+    $maxHostConfirm = 5
+    while ($hostResp -match $promptRegex -and $hostResp -notmatch '#\s*$' -and $maxHostConfirm -gt 0) {
+        Write-Log 'Confirming certificate-regeneration prompt for hostname change with "y".'
+        $hostResp = Send-Command -Port $Port -Command 'y' `
+            -ExpectPatterns @('#\s*$', $promptRegex) -TimeoutSec 30 -InterDelayMs $delayMs
+        $maxHostConfirm--
+    }
+    # CIMC 'scope network' has NO static DNS domain: "set domain-name" is rejected
+    # as an invalid command. A domain is only configurable via Dynamic DNS
+    # ('set ddns-update-domain'). Attempt it best-effort; if the firmware rejects
+    # it (DDNS disabled/unsupported), warn and continue rather than failing.
+    $domResp = Send-Command -Port $Port -Command "set ddns-update-domain $DnsDomain" `
+        -ExpectPatterns @('#\s*$') -TimeoutSec $cmdTO -InterDelayMs $delayMs
+    if ($domResp -match '(?i)invalid|error|\^\s') {
+        Write-Log -Level WARN ("DNS domain '$DnsDomain' was NOT applied: CIMC network scope has no static domain (DDNS may be disabled). Output: " + ($domResp -replace '[\r\n]+',' '))
+    } else {
+        Write-Log "DNS domain set via DDNS update-domain: $DnsDomain"
+    }
 
     if ([bool]$site.vlanEnabled) {
         Send-Command -Port $Port -Command 'set vlan-enabled yes' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
@@ -566,136 +711,43 @@ function Set-CimcNetwork {
         Send-Command -Port $Port -Command 'set vlan-enabled no' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
     }
 
-    # Disable IPv6 on the CIMC management interface unless the operator
-    # explicitly opted in via "ipv6Enabled": true in the JSON.
-    Disable-CimcIpv6 -Port $Port -Config $Config -EnableIpv6:$ipv6Enabled
+    # Disable IPv6 on the CIMC management interface (default on; staged here and
+    # applied by the network commit below). 'v6-enabled' is a network-scope
+    # property. Honour an explicit "disableIpv6": false to leave IPv6 untouched.
+    $disableV6 = if ($site.PSObject.Properties.Name -contains 'disableIpv6') { [bool]$site.disableIpv6 } else { $true }
+    if ($disableV6) {
+        Write-Log 'Disabling IPv6 on the CIMC management interface.'
+        Send-Command -Port $Port -Command 'set v6-enabled no' `
+            -ExpectPatterns @('#\s*$','Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+    }
 
-    # 'set hostname' on most CIMC firmware versions prompts:
-    #   "Create new certificate with CN as new hostname? [y|N]"
-    # immediately, BEFORE 'commit'. Accepting it auto-commits all queued
-    # network changes above (which is why we queued them first).
-    Invoke-CimcConfirmableCommand -Port $Port -Command "set hostname $Hostname" `
-        -CommandTimeoutSec $cmdTO -InterDelayMs $delayMs -Reason 'set hostname' | Out-Null
-
-    # The hostname auto-commit may have dropped us out of scope cimc/network
-    # and back to /cimc# (or even /). Re-enter the network scope so the
-    # explicit 'commit' below is always run from the right place; on firmware
-    # that did NOT auto-commit, this commit picks up any remaining changes.
-    Send-Command -Port $Port -Command 'top' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-    Send-Command -Port $Port -Command 'scope cimc' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-    Send-Command -Port $Port -Command 'scope network' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-
-    # Changing hostname (and sometimes the IP) can trigger additional interactive
-    # prompts on commit, e.g.:
+    # Changing hostname (and sometimes the IP) triggers one or more interactive
+    # prompts on commit, including:
     #   - "Changes will be applied. Continue? [y|N]"
     #   - "Hostname has been modified. A new certificate must be generated with
     #      the new hostname as CN. Continue? [y/N]"
-    Invoke-CimcConfirmableCommand -Port $Port -Command 'commit' `
-        -CommandTimeoutSec 30 -InterDelayMs $delayMs -Reason 'network commit' | Out-Null
-
-    # Read-back so the log captures what was actually applied. Useful when a
-    # silently-rejected setting (e.g. domain-name in the wrong scope) needs
-    # to be diagnosed after the fact.
-    $netState = Send-Command -Port $Port -Command 'show detail' `
-        -ExpectPatterns @('#\s*$') -TimeoutSec 15 -InterDelayMs $delayMs
-    Write-Log ("Post-commit /cimc/network state:`n" + $netState)
-
-    Write-Log 'Network commit accepted.'
-}
-
-# Disables IPv6 on /cimc/network. CIMC firmware varies on where IPv6 lives:
-#   - 4.x / newer 5.x:  /cimc/network # set ipv6-enabled no  (then commit)
-#   - some 3.x / 4.0:   /cimc/network # scope ipv6 ; set enabled no ; commit
-# Try the flat command first; if the CIMC reports it as invalid, fall back
-# to the sub-scope form. If both forms are rejected, log a warning and move
-# on rather than failing the whole run.
-function Disable-CimcIpv6 {
-    param(
-        [Parameter(Mandatory)][System.IO.Ports.SerialPort]$Port,
-        [Parameter(Mandatory)][object]$Config,
-        [switch]$EnableIpv6
-    )
-
-    $cmdTO   = [int]$Config.behavior.commandTimeoutSec
-    $delayMs = [int]$Config.behavior.interCommandDelayMs
-
-    if ($EnableIpv6) {
-        Write-Log 'Leaving IPv6 enabled per ipv6Enabled=true in config.'
-        # We do not re-enable IPv6 here because a fresh CIMC has it on by
-        # default; only this script disables it. If you ever need to flip a
-        # disabled interface back on, do that out-of-band.
-        return
-    }
-
-    Write-Log 'Disabling IPv6 on /cimc/network.'
-
-    $resp = Send-Command -Port $Port -Command 'set ipv6-enabled no' `
-        -ExpectPatterns @('#\s*$', 'Invalid', 'No such', 'Unknown') `
-        -TimeoutSec $cmdTO -InterDelayMs $delayMs
-
-    if ($resp -match 'Invalid|No such|Unknown') {
-        Write-Log 'set ipv6-enabled not recognized; trying scope ipv6 / set enabled no fallback.'
-        $scopeResp = Send-Command -Port $Port -Command 'scope ipv6' `
-            -ExpectPatterns @('#\s*$', 'Invalid', 'No such', 'Unknown') `
-            -TimeoutSec $cmdTO -InterDelayMs $delayMs
-
-        if ($scopeResp -match 'Invalid|No such|Unknown') {
-            Write-Log -Level WARN 'CIMC firmware exposes neither set ipv6-enabled nor scope ipv6; leaving IPv6 state unchanged.'
-            return
-        }
-
-        Send-Command -Port $Port -Command 'set enabled no' `
-            -ExpectPatterns @('#\s*$', 'Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-
-        Invoke-CimcConfirmableCommand -Port $Port -Command 'commit' `
-            -CommandTimeoutSec $cmdTO -InterDelayMs $delayMs -Reason 'IPv6 disable commit' | Out-Null
-
-        # Pop back up to /cimc/network so the rest of Set-CimcNetwork keeps
-        # working in the expected scope.
-        Send-Command -Port $Port -Command 'exit' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-    }
-}
-
-# Sends a command that may produce one or more interactive yes/no prompts
-# (e.g. [y|N], [y/N], "Continue?", "Create new certificate ... [y|N]") before
-# returning to the CIMC CLI '#' prompt. Answers 'y' to each prompt up to a
-# bounded number of confirmations and then returns the final response.
-function Invoke-CimcConfirmableCommand {
-    param(
-        [Parameter(Mandatory)][System.IO.Ports.SerialPort]$Port,
-        [Parameter(Mandatory)][string]$Command,
-        [Parameter(Mandatory)][int]$CommandTimeoutSec,
-        [Parameter(Mandatory)][int]$InterDelayMs,
-        [string]$Reason = 'command',
-        [int]$MaxConfirmations = 5
-    )
-
-    # Match the various confirmation prompts CIMC firmware uses. Note the
-    # literal "[y|N]" form (pipe), which is what 'set hostname' shows on the
-    # firmware that previously timed out.
-    $promptRegex = '\[y\|N\]|\[y/N\]|\[y/n\]|continue\?|regenerat.*certificate|hostname.*changed|create new certificate'
-
-    $resp = Send-Command -Port $Port -Command $Command `
+    # Loop and answer 'y' to each one until we are returned to the CLI prompt.
+    $resp = Send-Command -Port $Port -Command 'commit' `
         -ExpectPatterns @('#\s*$', $promptRegex) `
-        -TimeoutSec $CommandTimeoutSec -InterDelayMs $InterDelayMs
+        -TimeoutSec 30 -InterDelayMs $delayMs
 
-    $remaining = $MaxConfirmations
-    while ($resp -match $promptRegex -and $resp -notmatch '#\s*$' -and $remaining -gt 0) {
-        if ($resp -match 'regenerat.*certificate|hostname.*changed|create new certificate') {
-            Write-Log "$Reason - accepting certificate regeneration prompt with new hostname as CN."
+    $maxConfirmations = 5
+    while ($resp -match $promptRegex -and $resp -notmatch '#\s*$' -and $maxConfirmations -gt 0) {
+        if ($resp -match 'regenerat.*certificate|hostname.*changed') {
+            Write-Log 'Hostname changed - accepting certificate regeneration prompt with new hostname as CN.'
         } else {
-            Write-Log "$Reason - confirming prompt with 'y'."
+            Write-Log 'Confirming commit prompt with "y".'
         }
         $resp = Send-Command -Port $Port -Command 'y' `
             -ExpectPatterns @('#\s*$', $promptRegex) `
-            -TimeoutSec $CommandTimeoutSec -InterDelayMs $InterDelayMs
-        $remaining--
+            -TimeoutSec 30 -InterDelayMs $delayMs
+        $maxConfirmations--
     }
 
     if ($resp -notmatch '#\s*$') {
-        throw "$Reason did not return to CLI prompt after answering confirmations. Last response: '$resp'"
+        throw "Network commit did not return to CLI prompt after answering confirmations. Last response: '$resp'"
     }
-    return $resp
+    Write-Log 'Network commit accepted.'
 }
 
 function Set-CimcNtp {
@@ -726,14 +778,10 @@ function Set-CimcNtp {
     # the server entries on some firmware. Enable + commit first, then load the
     # servers and commit again.
     Write-Log 'Enabling NTP service (commit #1) before configuring NTP server slots.'
-    # 'set enabled yes' on the NTP scope can prompt:
-    #   "Warning: IPMI Set SEL Time command will be disabled if NTP is enabled.
-    #    Do you wish to continue? [y/N]"
-    Invoke-CimcConfirmableCommand -Port $Port -Command 'set enabled yes' `
-        -CommandTimeoutSec $cmdTO -InterDelayMs $delayMs -Reason 'NTP set enabled yes' | Out-Null
-
-    Invoke-CimcConfirmableCommand -Port $Port -Command 'commit' `
-        -CommandTimeoutSec 20 -InterDelayMs $delayMs -Reason 'NTP enable commit' | Out-Null
+    # "set enabled yes" warns: "IPMI Set SEL Time command will be disabled if NTP
+    # is enabled. Do you wish to continue? [y/N]" - Send-CimcConfirm answers 'y'.
+    Send-CimcConfirm -Port $Port -Command 'set enabled yes' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+    Send-CimcConfirm -Port $Port -Command 'commit' -TimeoutSec 30 -InterDelayMs $delayMs | Out-Null
 
     # Verify NTP is actually enabled before we try to load server addresses.
     $ntpStatus = Send-Command -Port $Port -Command 'show detail' `
@@ -748,16 +796,13 @@ function Set-CimcNtp {
     $slots = @('server-1','server-2','server-3','server-4')
     for ($i = 0; $i -lt $slots.Count; $i++) {
         if ($i -lt $ntp.Count) {
-            Send-Command -Port $Port -Command ("set {0} {1}" -f $slots[$i], $ntp[$i]) `
-                -ExpectPatterns @('#\s*$','Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+            Send-CimcConfirm -Port $Port -Command ("set {0} {1}" -f $slots[$i], $ntp[$i]) -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
         } else {
-            Send-Command -Port $Port -Command ("set {0} ''" -f $slots[$i]) `
-                -ExpectPatterns @('#\s*$','Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+            Send-CimcConfirm -Port $Port -Command ("set {0} ''" -f $slots[$i]) -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
         }
     }
 
-    Invoke-CimcConfirmableCommand -Port $Port -Command 'commit' `
-        -CommandTimeoutSec 20 -InterDelayMs $delayMs -Reason 'NTP servers commit' | Out-Null
+    Send-CimcConfirm -Port $Port -Command 'commit' -TimeoutSec 30 -InterDelayMs $delayMs | Out-Null
 
     # Read-back so the log captures the final NTP state for forensics.
     $finalNtp = Send-Command -Port $Port -Command 'show detail' `
@@ -773,8 +818,7 @@ function Set-CimcNtp {
             Send-Command -Port $Port -Command 'scope clock' -ExpectPatterns @('#\s*$','Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
             Send-Command -Port $Port -Command ("set timezone {0}" -f $Config.site.timezone) `
                 -ExpectPatterns @('#\s*$','Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-            Invoke-CimcConfirmableCommand -Port $Port -Command 'commit' `
-                -CommandTimeoutSec $cmdTO -InterDelayMs $delayMs -Reason 'timezone commit' | Out-Null
+            Send-Command -Port $Port -Command 'commit' -ExpectPatterns @('#\s*$') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
         }
     }
     Write-Log 'NTP configured.'
@@ -799,7 +843,7 @@ function Enable-IntersightDeviceConnector {
         Send-Command -Port $Port -Command 'scope device-connector' -ExpectPatterns @('#\s*$','Invalid scope') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
     }
 
-    Send-Command -Port $Port -Command 'set enabled yes'                -ExpectPatterns @('#\s*$','Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+    Send-CimcConfirm -Port $Port -Command 'set enabled yes'            -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
     Send-Command -Port $Port -Command 'set read-only-mode no'          -ExpectPatterns @('#\s*$','Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
     Send-Command -Port $Port -Command 'set tunneled-kvm-enabled yes'   -ExpectPatterns @('#\s*$','Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
     Send-Command -Port $Port -Command 'set auto-update-enabled yes'    -ExpectPatterns @('#\s*$','Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
@@ -812,8 +856,8 @@ function Enable-IntersightDeviceConnector {
         }
     }
 
-    Invoke-CimcConfirmableCommand -Port $Port -Command 'commit' `
-        -CommandTimeoutSec 20 -InterDelayMs $delayMs -Reason 'Intersight commit' | Out-Null
+    Send-CimcConfirm -Port $Port -Command 'commit' -TimeoutSec 30 -InterDelayMs $delayMs | Out-Null
+
 }
 
 # -------------------- Inventory helpers --------------------
@@ -850,16 +894,20 @@ function Invoke-ConfigureServer {
         throw "COM port '$ComPort' not found. Available: $([System.IO.Ports.SerialPort]::GetPortNames() -join ', ')"
     }
 
-    $port = $null
+    # Stored so Reset-CimcPort can perform a true drop/reconnect (dispose + new
+    # port object) when the CIMC console resets after a password change/reboot.
+    $script:PortName     = $ComPort
+    $script:SerialConfig = $Config.serial
+    $script:Port         = $null
     try {
-        $port = Open-CimcSerial -PortName $ComPort -Serial $Config.serial
-        Invoke-CimcLogin           -Port $port -Behavior $Config.behavior
-        Set-CimcNetwork            -Port $port -Config $Config -Ip $ip -Hostname $hn `
+        $script:Port = Open-CimcSerial -PortName $ComPort -Serial $Config.serial
+        Invoke-CimcLogin           -Port $script:Port -Behavior $Config.behavior
+        Set-CimcNetwork            -Port $script:Port -Config $Config -Ip $ip -Hostname $hn `
                                    -PrimaryDns $dns1 -SecondaryDns $dns2 -DnsDomain $domain
         Start-Sleep -Seconds 3
-        Set-CimcNtp                -Port $port -Config $Config -NtpServers $ntp
-        Enable-IntersightDeviceConnector -Port $port -Config $Config
-        Invoke-CimcLogout          -Port $port
+        Set-CimcNtp                -Port $script:Port -Config $Config -NtpServers $ntp
+        Enable-IntersightDeviceConnector -Port $script:Port -Config $Config
+        Invoke-CimcLogout          -Port $script:Port
         Write-Log "===== Finished configuration for $hn ($ip) ====="
     }
     catch {
@@ -867,7 +915,7 @@ function Invoke-ConfigureServer {
         throw
     }
     finally {
-        if ($port -and $port.IsOpen) { $port.Close(); $port.Dispose() }
+        if ($script:Port -and $script:Port.IsOpen) { $script:Port.Close(); $script:Port.Dispose() }
     }
 }
 
