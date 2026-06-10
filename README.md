@@ -8,9 +8,9 @@ The script configures **one server at a time** over a single COM port. All
 editable values live in a single **JSONC** file (`cimc-config.jsonc`). JSONC is
 JSON plus comments — open it in Notepad, VS Code, or any text editor.
 
-> **First time using this?** Start with **[`BEGINNERS_GUIDE.md`](./BEGINNERS_GUIDE.md)**.
-> It walks you through connecting the serial cable, finding your COM port,
-> editing the JSON file, and running the script step by step.
+> **First time using this?** Start with **[`DEPLOYMENT_GUIDE.md`](./DEPLOYMENT_GUIDE.md)**.
+> It walks you through connecting the serial cable, identifying your serial port
+> (Windows/macOS/Linux), editing the JSON file, and running the script step by step.
 
 ## Files
 
