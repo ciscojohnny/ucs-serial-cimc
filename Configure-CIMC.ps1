@@ -269,19 +269,42 @@ function Open-CimcSerial {
     return $port
 }
 
+function Invoke-PortToggle {
+    # Open and immediately close the serial device in a SEPARATE short-lived
+    # process. After a CIMC management-console reset (first-time password change,
+    # reboot/factory reset) the console stays mute until the serial connection is
+    # physically dropped and reopened. Empirically (confirmed against SecureCRT
+    # and standalone probes) an in-process .NET Close()/Dispose() + reopen does
+    # NOT drive the DTR/RTS lines low->high at the macOS driver level, but a fresh
+    # process open/close does (the OS guarantees the handle is released and the
+    # control lines drop when the child exits). So we shell out to a tiny child
+    # pwsh whose only job is to toggle the lines, exactly like clicking "connect"
+    # in SecureCRT. -EncodedCommand avoids all nested-quoting pitfalls.
+    param(
+        [Parameter(Mandatory)][string]$PortName,
+        [Parameter(Mandatory)][int]$Baud
+    )
+    $child = "try { `$q=[System.IO.Ports.SerialPort]::new('$PortName',$Baud); " +
+             "`$q.DtrEnable=`$true; `$q.RtsEnable=`$true; `$q.Open(); " +
+             "Start-Sleep -Milliseconds 700; `$q.Close(); `$q.Dispose() } catch {}"
+    $enc = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($child))
+    try { & pwsh -NoProfile -EncodedCommand $enc 2>$null | Out-Null } catch {}
+}
+
 function Reset-CimcPort {
-    # Perform a TRUE drop/reconnect: fully dispose the serial port (releasing the
-    # OS handle) and create a brand-new one. After the CIMC management console
-    # resets (first-time password change, reboot/factory reset) it stays mute
-    # until the serial connection is actually dropped and reopened - exactly what
-    # SecureCRT/screen or a fresh process does. A same-object Close()/Open() does
-    # NOT reliably toggle DTR/RTS at the driver level on macOS, so we recreate
-    # the object. Returns the new port (also stored in $script:Port), or $null if
-    # the reopen failed (caller should retry).
+    # Perform a TRUE drop/reconnect that wakes a parked CIMC console. We must (1)
+    # release our own OS handle, (2) toggle the control lines from a SEPARATE
+    # process (see Invoke-PortToggle - this is the part an in-process reopen
+    # cannot do reliably on macOS), then (3) open a brand-new port in this
+    # process to drive the rest of the session. Returns the new port (also stored
+    # in $script:Port), or $null if the reopen failed (caller should retry).
     param([Parameter(Mandatory)][AllowNull()][System.IO.Ports.SerialPort]$Port)
     try { if ($Port -and $Port.IsOpen) { $Port.Close() } } catch {}
     try { if ($Port) { $Port.Dispose() } } catch {}
-    Start-Sleep -Milliseconds 1200
+    Start-Sleep -Milliseconds 600
+    # Real OS-level line toggle from a child process (mimics SecureCRT reconnect).
+    Invoke-PortToggle -PortName $script:PortName -Baud ([int]$script:SerialConfig.baudRate)
+    Start-Sleep -Milliseconds 600
     try {
         $new = Open-CimcSerial -PortName $script:PortName -Serial $script:SerialConfig
         $script:Port = $new
@@ -289,6 +312,24 @@ function Reset-CimcPort {
     } catch {
         return $null
     }
+}
+
+function Send-WakeSequence {
+    # The Cisco UCS serial console sits parked/blank (no banner, no prompt) until
+    # it receives the ESC+9 escape sequence, which switches the serial port over
+    # to the CIMC login prompt - this is the manual "press ESC then 9 in SecureCRT
+    # to see the login prompt" step. A bare CR/LF (or a DTR/RTS toggle alone) does
+    # NOT wake it. Send ESC, then '9', then a CR so the login banner renders, with
+    # small gaps so the console treats it as a real ESC sequence rather than noise.
+    param([Parameter(Mandatory)][System.IO.Ports.SerialPort]$Port)
+    try {
+        $Port.Write([string][char]27)   # ESC
+        Start-Sleep -Milliseconds 200
+        $Port.Write('9')
+        Start-Sleep -Milliseconds 200
+        $Port.Write("`r")
+        Start-Sleep -Milliseconds 500
+    } catch {}
 }
 
 function Read-Until {
@@ -356,7 +397,7 @@ $script:RxCli        = '#\s*$'
 $script:RxCurrentPwd = '(?i)current password:\s*$'
 $script:RxNewPwd     = '(?i)new password:\s*$'
 $script:RxConfirmPwd = '(?i)(?:re-?enter|re-?type|confirm)[^\r\n]*password:\s*$'
-$script:RxLoginFail  = '(?i)(login incorrect|permission denied|authentication fail|does not match|password mismatch|invalid password)'
+$script:RxLoginFail  = '(?i)(login incorrect|login failed|permission denied|authentication fail|does not match|password mismatch|invalid password|username/password is wrong)'
 
 # Interactive confirmation prompts CIMC can raise after a 'set'/'commit'
 # (e.g. "Do you wish to continue? [y/N]", certificate regeneration). Kept here
@@ -454,11 +495,13 @@ function Invoke-PasswordChange {
         while (-not $loggedIn -and $waited.Elapsed.TotalSeconds -lt $recoverTO) {
             Start-Sleep -Seconds 10
 
-            # The console only resumes after a true drop/reconnect, so recreate
-            # the port each attempt.
+            # Recreate the port (fresh handle, like reconnecting in SecureCRT),
+            # then ESC+9 to bring the login prompt back to the serial line.
             $Port = Reset-CimcPort -Port $Port
             if (-not $Port) { continue }
-            try { $Port.Write("`r"); Start-Sleep -Milliseconds 400; $Port.DiscardInBuffer() } catch { continue }
+            try { $Port.DiscardInBuffer() } catch { continue }
+            # Wake/redirect the serial console to the CIMC login prompt (ESC+9).
+            Send-WakeSequence -Port $Port
 
             # Speculatively send the username; a live console answers "Password:".
             $uResp = $null
@@ -543,16 +586,15 @@ function Invoke-CimcLogin {
     while (-not $atPass -and $waited.Elapsed.TotalSeconds -lt $bootTO) {
         if (-not $firstPass) {
             Start-Sleep -Seconds 10
-            # The console only resumes after a true drop/reconnect, so recreate
-            # the port before each retry.
+            # Recreate the port (fresh handle), then ESC+9 below wakes the console.
             $Port = Reset-CimcPort -Port $Port
             if (-not $Port) { continue }
         }
         $firstPass = $false
 
         try { $Port.DiscardInBuffer() } catch {}
-        $Port.Write("`r"); Start-Sleep -Milliseconds 400
-        try { $Port.DiscardInBuffer() } catch {}
+        # Wake/redirect the serial console to the CIMC login prompt (ESC+9).
+        Send-WakeSequence -Port $Port
 
         # See if the console volunteers a recognizable prompt first.
         $resp = ''
