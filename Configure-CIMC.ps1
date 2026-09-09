@@ -48,7 +48,18 @@ param(
     # Path to the configuration file. Defaults to cimc-config.jsonc next to this script.
     [string]$ConfigPath = (Join-Path $PSScriptRoot 'cimc-config.jsonc'),
 
-    [string]$LogDirectory = (Join-Path $PSScriptRoot 'logs')
+    [string]$LogDirectory = (Join-Path $PSScriptRoot 'logs'),
+
+    # Firmware upgrade via CIMC-mapped vMedia. When present, forces the firmware
+    # step on for this run (overrides "firmware".enabled=false in the config).
+    # The ISO is served from a local folder over HTTP and the CIMC is set to
+    # boot from the mapped vDVD first, then the local LUN.
+    [switch]$Firmware,
+
+    # Optional per-run overrides for the firmware step (otherwise taken from the
+    # "firmware" block in the config file).
+    [string]$IsoFile,
+    [string]$IsoFolder
 )
 
 # -------------------- Constants that should not be edited by end users -----
@@ -902,6 +913,252 @@ function Enable-IntersightDeviceConnector {
 
 }
 
+# -------------------- Firmware upgrade via CIMC-mapped vMedia --------------------
+# The CIMC reads virtual media over its OWN management IP network (NOT over the
+# serial cable). So to boot an ISO that lives "on the laptop", the laptop must
+# run a web server that the CIMC's configured IP can reach, and we map the ISO
+# with `scope vmedia` / `map-www`. We then set the precision boot order so the
+# CIMC boots the mapped vDVD first and the local LUN second, and power-cycle.
+
+function Get-ServeHostAddress {
+    # Best-effort discovery of this machine's primary IPv4 that the CIMC would
+    # use to reach us. Opening a UDP socket toward the gateway picks the routable
+    # local address without sending any traffic. Prefer an explicit override for
+    # multi-homed laptops (the auto-pick may not be on the CIMC mgmt network).
+    param([string]$Override)
+    if ($Override) { return $Override }
+    try {
+        $s = [System.Net.Sockets.Socket]::new(
+            [System.Net.Sockets.AddressFamily]::InterNetwork,
+            [System.Net.Sockets.SocketType]::Dgram,
+            [System.Net.Sockets.ProtocolType]::Udp)
+        $s.Connect('8.8.8.8', 65530)
+        $ip = ([System.Net.IPEndPoint]$s.LocalEndPoint).Address.ToString()
+        $s.Close()
+        return $ip
+    } catch { return $null }
+}
+
+function Start-IsoHttpServer {
+    # Serve $Folder over HTTP on $Port using Python's built-in server. Returns
+    # the running Process object (kept alive until the upgrade finishes).
+    param(
+        [Parameter(Mandatory)][string]$Folder,
+        [Parameter(Mandatory)][int]$Port
+    )
+    if (-not (Test-Path -LiteralPath $Folder)) {
+        throw "Firmware folder not found: '$Folder'."
+    }
+    $python = Get-Command python3 -ErrorAction SilentlyContinue
+    if (-not $python) { $python = Get-Command python -ErrorAction SilentlyContinue }
+    if (-not $python) {
+        throw "python3 is required to serve the ISO locally (transport 'http-local'). Install Python 3, or set firmware.transport to 'url' and provide firmware.shareUrl."
+    }
+    $full = (Resolve-Path -LiteralPath $Folder).Path
+    Write-Log "Starting local HTTP server: folder='$full' port=$Port (python: $($python.Source))"
+    $psi = [System.Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName               = $python.Source
+    $psi.Arguments              = "-m http.server $Port --bind 0.0.0.0"
+    $psi.WorkingDirectory       = $full
+    $psi.UseShellExecute        = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError  = $true
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    Start-Sleep -Seconds 1
+    if ($proc.HasExited) {
+        throw "Local HTTP server exited immediately (is port $Port already in use?)."
+    }
+    return $proc
+}
+
+function Stop-IsoHttpServer {
+    param([System.Diagnostics.Process]$Proc)
+    if ($Proc -and -not $Proc.HasExited) {
+        try { $Proc.Kill() } catch {}
+        try { $Proc.WaitForExit(3000) | Out-Null } catch {}
+        Write-Log 'Local HTTP server stopped.'
+    }
+}
+
+function Set-CimcVmediaMap {
+    # Map the ISO into a CIMC vMedia volume and verify Map-Status is OK.
+    param(
+        [Parameter(Mandatory)][System.IO.Ports.SerialPort]$Port,
+        [Parameter(Mandatory)][object]$Config,
+        [Parameter(Mandatory)][string]$Volume,
+        [Parameter(Mandatory)][string]$BaseUrl,
+        [Parameter(Mandatory)][string]$IsoFile,
+        [string]$User,
+        [string]$Pass
+    )
+    $cmdTO   = [int]$Config.behavior.commandTimeoutSec
+    $delayMs = [int]$Config.behavior.interCommandDelayMs
+
+    Send-Command -Port $Port -Command 'top' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+    Send-Command -Port $Port -Command 'scope vmedia' -ExpectPatterns @('#\s*$','Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+
+    # Remove any pre-existing volume with the same name so re-runs are clean.
+    Send-CimcConfirm -Port $Port -Command "unmap $Volume" -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+
+    Write-Log "Mapping vMedia volume '$Volume' -> ${BaseUrl}${IsoFile}"
+    # map-www {volume-name} {remote-share} {remote-file}
+    $resp = Send-Command -Port $Port -Command ("map-www {0} {1} {2}" -f $Volume, $BaseUrl, $IsoFile) `
+        -ExpectPatterns @('#\s*$', '(?i)user\s*name:\s*$', '(?i)password:\s*$', 'Invalid', 'Error') `
+        -TimeoutSec $cmdTO -InterDelayMs $delayMs
+
+    # map-www may prompt for credentials; answer with provided creds or blanks.
+    $guard = 4
+    while ($guard-- -gt 0 -and ($resp -match '(?i)user\s*name:\s*$' -or $resp -match '(?i)password:\s*$')) {
+        if ($resp -match '(?i)user\s*name:\s*$') {
+            $resp = Send-Command -Port $Port -Command ([string]$User) `
+                -ExpectPatterns @('#\s*$', '(?i)password:\s*$', 'Invalid', 'Error') -TimeoutSec $cmdTO -InterDelayMs $delayMs
+        }
+        elseif ($resp -match '(?i)password:\s*$') {
+            $resp = Send-Command -Port $Port -Command ([string]$Pass) `
+                -ExpectPatterns @('#\s*$', 'Invalid', 'Error') -TimeoutSec $cmdTO -InterDelayMs $delayMs -Sensitive
+        }
+    }
+
+    # Give the CIMC a moment to fetch headers, then verify.
+    Start-Sleep -Seconds 3
+    $status = Send-Command -Port $Port -Command 'show mappings detail' `
+        -ExpectPatterns @('#\s*$') -TimeoutSec $cmdTO -InterDelayMs $delayMs
+
+    if ($status -match '(?i)Map-Status\s*:\s*OK' -or $status -match "(?i)$([regex]::Escape($Volume))\s+OK") {
+        Write-Log "vMedia mapping '$Volume' reported Map-Status OK."
+    } else {
+        Write-Log -Level WARN "vMedia mapping '$Volume' did not report OK. Check reachability from the CIMC to $BaseUrl (firewall / laptop on the mgmt network?). show mappings output was logged."
+    }
+    return $status
+}
+
+function Set-CimcVmediaBootOrder {
+    # Precision boot order: mapped vDVD first, local LUN second.
+    param(
+        [Parameter(Mandatory)][System.IO.Ports.SerialPort]$Port,
+        [Parameter(Mandatory)][object]$Config,
+        [Parameter(Mandatory)][object]$Fw
+    )
+    $cmdTO   = [int]$Config.behavior.commandTimeoutSec
+    $delayMs = [int]$Config.behavior.interCommandDelayMs
+
+    $dvdName   = if ($Fw.dvdBootName)   { [string]$Fw.dvdBootName }   else { 'vDVD' }
+    $dvdSub    = if ($Fw.vmediaSubtype) { [string]$Fw.vmediaSubtype } else { 'CIMCMAPPEDDVD' }
+    $lunName   = if ($Fw.localBootName) { [string]$Fw.localBootName } else { 'LocalLUN' }
+    $lunType   = if ($Fw.localBootType) { [string]$Fw.localBootType } else { 'LOCALHDD' }
+
+    Send-Command -Port $Port -Command 'top' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+    Send-Command -Port $Port -Command 'scope bios' -ExpectPatterns @('#\s*$','Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+
+    # Log the existing boot devices for reference/troubleshooting.
+    $existing = Send-Command -Port $Port -Command 'show boot-device' -ExpectPatterns @('#\s*$') -TimeoutSec $cmdTO -InterDelayMs $delayMs
+    Write-Log "Existing precision boot devices:`n$existing"
+
+    # ---- Mapped vDVD as boot device #1 ----
+    Send-CimcConfirm -Port $Port -Command ("create-boot-device {0} VMEDIA" -f $dvdName) -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+    Send-CimcConfirm -Port $Port -Command 'commit' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+    Send-Command -Port $Port -Command ("scope boot-device {0}" -f $dvdName) -ExpectPatterns @('#\s*$','Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+    $subResp = Send-Command -Port $Port -Command ("set subtype {0}" -f $dvdSub) -ExpectPatterns @('#\s*$','Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs
+    if ($subResp -match 'Invalid') {
+        Write-Log -Level WARN "vMedia boot subtype '$dvdSub' was rejected; run 'set subtype' with no value under scope boot-device $dvdName to list valid tokens (varies by firmware). Continuing without an explicit subtype."
+    }
+    Send-Command -Port $Port -Command 'set order 1'      -ExpectPatterns @('#\s*$','Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+    Send-Command -Port $Port -Command 'set state Enabled' -ExpectPatterns @('#\s*$','Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+    Send-CimcConfirm -Port $Port -Command 'commit' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+    Send-Command -Port $Port -Command 'exit' -ExpectPatterns @('#\s*$') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+
+    # ---- Local LUN as boot device #2 ----
+    $lunScope = Send-Command -Port $Port -Command ("scope boot-device {0}" -f $lunName) -ExpectPatterns @('#\s*$','Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs
+    if ($lunScope -match 'Invalid') {
+        Send-CimcConfirm -Port $Port -Command ("create-boot-device {0} {1}" -f $lunName, $lunType) -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+        Send-CimcConfirm -Port $Port -Command 'commit' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+        Send-Command -Port $Port -Command ("scope boot-device {0}" -f $lunName) -ExpectPatterns @('#\s*$','Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+    }
+    Send-Command -Port $Port -Command 'set order 2'      -ExpectPatterns @('#\s*$','Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+    Send-Command -Port $Port -Command 'set state Enabled' -ExpectPatterns @('#\s*$','Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+    Send-CimcConfirm -Port $Port -Command 'commit' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+    Send-Command -Port $Port -Command 'exit' -ExpectPatterns @('#\s*$') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+
+    $final = Send-Command -Port $Port -Command 'show boot-device' -ExpectPatterns @('#\s*$') -TimeoutSec $cmdTO -InterDelayMs $delayMs
+    Write-Log "Configured precision boot order:`n$final"
+}
+
+function Invoke-CimcPowerCycle {
+    param(
+        [Parameter(Mandatory)][System.IO.Ports.SerialPort]$Port,
+        [Parameter(Mandatory)][object]$Config
+    )
+    $cmdTO   = [int]$Config.behavior.commandTimeoutSec
+    $delayMs = [int]$Config.behavior.interCommandDelayMs
+    Write-Log 'Power-cycling the server to boot the mapped ISO.'
+    Send-Command -Port $Port -Command 'top' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+    Send-Command -Port $Port -Command 'scope chassis' -ExpectPatterns @('#\s*$','Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+    $resp = Send-CimcConfirm -Port $Port -Command 'power cycle' -TimeoutSec $cmdTO -InterDelayMs $delayMs
+    if ($resp -match 'Invalid') {
+        Write-Log -Level WARN "'power cycle' was rejected under scope chassis on this firmware; power-cycle the server manually to boot the ISO."
+    }
+}
+
+function Invoke-FirmwareUpgrade {
+    param(
+        [Parameter(Mandatory)][System.IO.Ports.SerialPort]$Port,
+        [Parameter(Mandatory)][object]$Config
+    )
+    $fw = $Config.firmware
+
+    # Resolve settings (CLI overrides win over the config file).
+    $isoFolder = if ($script:IsoFolderOverride) { $script:IsoFolderOverride } elseif ($fw.isoFolder) { [string]$fw.isoFolder } else { $null }
+    $isoFile   = if ($script:IsoFileOverride)   { $script:IsoFileOverride }   elseif ($fw.isoFile)   { [string]$fw.isoFile }   else { $null }
+    $transport = if ($fw.transport) { [string]$fw.transport } else { 'http-local' }
+    $volume    = if ($fw.vmediaVolume) { [string]$fw.vmediaVolume } else { 'firmware' }
+    $port      = if ($fw.servePort) { [int]$fw.servePort } else { 8000 }
+    $powerCyc  = if ($fw.PSObject.Properties.Name -contains 'powerCycle') { [bool]$fw.powerCycle } else { $true }
+
+    if (-not $isoFile) { throw 'Firmware step is enabled but no ISO file name was provided (firmware.isoFile or -IsoFile).' }
+
+    $server = $null
+    try {
+        if ($transport -ieq 'http-local') {
+            if (-not $isoFolder) { throw 'firmware.transport is "http-local" but no folder was provided (firmware.isoFolder or -IsoFolder).' }
+            $isoPath = Join-Path $isoFolder $isoFile
+            if (-not (Test-Path -LiteralPath $isoPath)) {
+                throw "ISO not found: '$isoPath'. Put the firmware ISO in the folder and check the file name."
+            }
+            $serveHost = Get-ServeHostAddress -Override ([string]$fw.serveHost)
+            if (-not $serveHost) { throw 'Could not determine a local IP to serve the ISO from. Set firmware.serveHost explicitly.' }
+            $server  = Start-IsoHttpServer -Folder $isoFolder -Port $port
+            $baseUrl = "http://${serveHost}:${port}/"
+            Write-Log "Serving ISO to CIMC at ${baseUrl}${isoFile} (the CIMC's IP must be able to reach ${serveHost}:${port})."
+            Set-CimcVmediaMap -Port $Port -Config $Config -Volume $volume -BaseUrl $baseUrl -IsoFile $isoFile `
+                -User ([string]$fw.shareUser) -Pass ([string]$fw.sharePassword) | Out-Null
+        }
+        elseif ($transport -ieq 'url') {
+            $baseUrl = [string]$fw.shareUrl
+            if (-not $baseUrl) { throw 'firmware.transport is "url" but firmware.shareUrl is not set.' }
+            if ($baseUrl[-1] -ne '/') { $baseUrl += '/' }
+            Set-CimcVmediaMap -Port $Port -Config $Config -Volume $volume -BaseUrl $baseUrl -IsoFile $isoFile `
+                -User ([string]$fw.shareUser) -Pass ([string]$fw.sharePassword) | Out-Null
+        }
+        else {
+            throw "Unknown firmware.transport '$transport' (expected 'http-local' or 'url')."
+        }
+
+        Set-CimcVmediaBootOrder -Port $Port -Config $Config -Fw $fw
+        if ($powerCyc) { Invoke-CimcPowerCycle -Port $Port -Config $Config }
+
+        if ($server) {
+            Write-Host ''
+            Write-Host "ISO is mapped and the server is booting to it. The local HTTP server must stay running" -ForegroundColor Yellow
+            Write-Host "while the CIMC reads the media (this can take a long time for a firmware update)." -ForegroundColor Yellow
+            Write-Host "Press Enter here ONLY when the upgrade is complete to stop serving the ISO..." -ForegroundColor Yellow
+            [void](Read-Host)
+        }
+    }
+    finally {
+        if ($server) { Stop-IsoHttpServer -Proc $server }
+    }
+}
+
 # -------------------- Inventory helpers --------------------
 function Get-ServerEntry {
     param(
@@ -949,6 +1206,10 @@ function Invoke-ConfigureServer {
         Start-Sleep -Seconds 3
         Set-CimcNtp                -Port $script:Port -Config $Config -NtpServers $ntp
         Enable-IntersightDeviceConnector -Port $script:Port -Config $Config
+        if ($script:FirmwareEnabled) {
+            Write-Log 'Firmware step enabled: mapping ISO via vMedia and setting boot order.'
+            Invoke-FirmwareUpgrade -Port $script:Port -Config $Config
+        }
         Invoke-CimcLogout          -Port $script:Port
         Write-Log "===== Finished configuration for $hn ($ip) ====="
     }
@@ -968,6 +1229,19 @@ try {
 
     $Config = Read-CimcConfig -Path $ConfigPath
     Resolve-Credentials -Config $Config
+
+    # Firmware step: on if -Firmware is passed, or firmware.enabled is true.
+    $script:IsoFileOverride   = if ($PSBoundParameters.ContainsKey('IsoFile'))   { $IsoFile }   else { $null }
+    $script:IsoFolderOverride = if ($PSBoundParameters.ContainsKey('IsoFolder')) { $IsoFolder } else { $null }
+    $script:FirmwareEnabled   = [bool]$Firmware
+    if (-not $script:FirmwareEnabled -and $Config.PSObject.Properties.Name -contains 'firmware' -and $Config.firmware) {
+        if ($Config.firmware.PSObject.Properties.Name -contains 'enabled') {
+            $script:FirmwareEnabled = [bool]$Config.firmware.enabled
+        }
+    }
+    if ($script:FirmwareEnabled -and -not ($Config.PSObject.Properties.Name -contains 'firmware' -and $Config.firmware)) {
+        throw 'Firmware step requested but the config has no "firmware" block. Add one to cimc-config.jsonc (see the sample).'
+    }
 
     $server = Get-ServerEntry -Servers $Config.servers -HostName $HostName
     Write-Host ''
