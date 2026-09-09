@@ -920,13 +920,59 @@ function Enable-IntersightDeviceConnector {
 # with `scope vmedia` / `map-www`. We then set the precision boot order so the
 # CIMC boots the mapped vDVD first and the local LUN second, and power-cycle.
 
+function Get-LocalIPv4Addresses {
+    # All usable local IPv4 addresses (skips loopback and link-local).
+    $list = @()
+    try {
+        foreach ($ni in [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()) {
+            if ($ni.OperationalStatus -ne [System.Net.NetworkInformation.OperationalStatus]::Up) { continue }
+            foreach ($ua in $ni.GetIPProperties().UnicastAddresses) {
+                if ($ua.Address.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork) { continue }
+                $ip = $ua.Address.ToString()
+                if ($ip -like '127.*' -or $ip -like '169.254.*') { continue }
+                $list += $ip
+            }
+        }
+    } catch {}
+    return $list
+}
+
+function Test-IpInSubnet {
+    # True if $A and $B are in the same IPv4 subnet under $Mask.
+    param([string]$A, [string]$B, [string]$Mask)
+    try {
+        $ab = ([System.Net.IPAddress]::Parse($A)).GetAddressBytes()
+        $bb = ([System.Net.IPAddress]::Parse($B)).GetAddressBytes()
+        $mb = ([System.Net.IPAddress]::Parse($Mask)).GetAddressBytes()
+        for ($i = 0; $i -lt 4; $i++) {
+            if ((($ab[$i] -band $mb[$i]) -ne ($bb[$i] -band $mb[$i]))) { return $false }
+        }
+        return $true
+    } catch { return $false }
+}
+
 function Get-ServeHostAddress {
-    # Best-effort discovery of this machine's primary IPv4 that the CIMC would
-    # use to reach us. Opening a UDP socket toward the gateway picks the routable
-    # local address without sending any traffic. Prefer an explicit override for
-    # multi-homed laptops (the auto-pick may not be on the CIMC mgmt network).
-    param([string]$Override)
+    # Determine the laptop IPv4 the CIMC should use to reach our ISO server.
+    #   1) explicit override wins;
+    #   2) otherwise prefer a local IPv4 that is IN THE SAME SUBNET as the CIMC
+    #      (e.g. the Ethernet cabled directly to the CIMC mgmt port) - this is
+    #      the address the CIMC can actually reach;
+    #   3) fall back to the default-route interface (may be Wi-Fi/corp and NOT
+    #      reachable by the CIMC - warn if we land here).
+    param([string]$Override, [string]$TargetIp, [string]$SubnetMask)
     if ($Override) { return $Override }
+
+    if ($TargetIp -and $SubnetMask) {
+        foreach ($addr in (Get-LocalIPv4Addresses)) {
+            if ($addr -eq $TargetIp) { continue }
+            if (Test-IpInSubnet -A $addr -B $TargetIp -Mask $SubnetMask) {
+                Write-Log "Serve host $addr is on the CIMC subnet ($TargetIp/$SubnetMask); using it."
+                return $addr
+            }
+        }
+        Write-Log -Level WARN "No local IP found on the CIMC subnet ($TargetIp/$SubnetMask). Make sure your Ethernet to the CIMC has a static IP in that subnet, or set firmware.serveHost. Falling back to the default-route address."
+    }
+
     try {
         $s = [System.Net.Sockets.Socket]::new(
             [System.Net.Sockets.AddressFamily]::InterNetwork,
@@ -1102,7 +1148,8 @@ function Invoke-CimcPowerCycle {
 function Invoke-FirmwareUpgrade {
     param(
         [Parameter(Mandatory)][System.IO.Ports.SerialPort]$Port,
-        [Parameter(Mandatory)][object]$Config
+        [Parameter(Mandatory)][object]$Config,
+        [string]$TargetIp
     )
     $fw = $Config.firmware
 
@@ -1124,7 +1171,7 @@ function Invoke-FirmwareUpgrade {
             if (-not (Test-Path -LiteralPath $isoPath)) {
                 throw "ISO not found: '$isoPath'. Put the firmware ISO in the folder and check the file name."
             }
-            $serveHost = Get-ServeHostAddress -Override ([string]$fw.serveHost)
+            $serveHost = Get-ServeHostAddress -Override ([string]$fw.serveHost) -TargetIp $TargetIp -SubnetMask ([string]$Config.site.subnetMask)
             if (-not $serveHost) { throw 'Could not determine a local IP to serve the ISO from. Set firmware.serveHost explicitly.' }
             $server  = Start-IsoHttpServer -Folder $isoFolder -Port $port
             $baseUrl = "http://${serveHost}:${port}/"
@@ -1208,7 +1255,7 @@ function Invoke-ConfigureServer {
         Enable-IntersightDeviceConnector -Port $script:Port -Config $Config
         if ($script:FirmwareEnabled) {
             Write-Log 'Firmware step enabled: mapping ISO via vMedia and setting boot order.'
-            Invoke-FirmwareUpgrade -Port $script:Port -Config $Config
+            Invoke-FirmwareUpgrade -Port $script:Port -Config $Config -TargetIp $ip
         }
         Invoke-CimcLogout          -Port $script:Port
         Write-Log "===== Finished configuration for $hn ($ip) ====="
