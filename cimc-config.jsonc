@@ -86,6 +86,57 @@
     },
 
 
+    // -------- Firmware upgrade via CIMC-mapped vMedia (optional) --------------
+    //  Boots the connected server from an ISO (e.g. the Cisco HUU firmware ISO)
+    //  by mapping it as CIMC virtual media and putting it first in the boot
+    //  order, with the local LUN second.
+    //
+    //  IMPORTANT: the CIMC reads vMedia over its MANAGEMENT IP network, NOT over
+    //  the serial cable. With transport "http-local" the script serves the ISO
+    //  from your laptop over HTTP, so the laptop must ALSO be on (or routable to)
+    //  the CIMC management network and its firewall must allow inbound on
+    //  servePort. If that isn't possible, host the ISO elsewhere and use
+    //  transport "url" with shareUrl instead.
+    //
+    //  serveHost auto-detects the laptop IP that is on the CIMC's subnet, so if
+    //  your Ethernet to the CIMC has a static IP in that subnet you can leave it
+    //  null. Set it explicitly only to override.
+    //
+    //  Enable per run with -Firmware on the command line, or set "enabled": true.
+    "firmware": {
+        "enabled":        false,
+
+        // "http-local" = serve isoFolder from this laptop over HTTP.
+        // "url"        = the ISO is already hosted; use shareUrl below.
+        "transport":      "http-local",
+
+        // Folder on THIS laptop that holds the ISO, and the ISO file name.
+        "isoFolder":      "/Users/you/Desktop/firmware",
+        "isoFile":        "ucs-c220m7-huu.iso",
+
+        // Local HTTP server settings (transport "http-local").
+        //   serveHost: IP the CIMC should use to reach this laptop.
+        //              null = auto-detect the NIC on the CIMC subnet.
+        "serveHost":      null,
+        "servePort":      8000,
+
+        // Pre-hosted share (transport "url"): e.g. "http://10.10.10.9/iso/"
+        "shareUrl":       null,
+        "shareUser":      null,
+        "sharePassword":  null,
+
+        // vMedia + boot-order tuning (defaults suit most CIMC 4.x/5.x).
+        "vmediaVolume":   "firmware",
+        "vmediaSubtype":  "CIMCMAPPEDDVD",   // CIMC-mapped vDVD subtype
+        "dvdBootName":    "vDVD",            // precision boot device name (order 1)
+        "localBootName":  "LocalLUN",        // local boot device name (order 2)
+        "localBootType":  "LOCALHDD",        // device type for the local LUN
+
+        // Power-cycle the server after setting the boot order so it boots the ISO.
+        "powerCycle":     true
+    },
+
+
     // =========================================================================
     //  PER-SERVER ENTRIES
     //  -----------------------------------------------------------------------

@@ -23,8 +23,9 @@ Keep an inventory of every server you'll eventually configure in
 7. [Step 5 — Edit `cimc-config.jsonc`](#step-5--edit-cimc-configjsonc)
 8. [Step 6 — Run the script](#step-6--run-the-script)
 9. [Step 7 — Claim the server in Intersight](#step-7--claim-the-server-in-intersight)
-10. [Troubleshooting](#troubleshooting)
-11. [Glossary](#glossary)
+10. [Optional — Boot a firmware ISO (HUU) via vMedia](#optional--boot-a-firmware-iso-huu-via-vmedia)
+11. [Troubleshooting](#troubleshooting)
+12. [Glossary](#glossary)
 
 ---
 
@@ -470,6 +471,98 @@ Within a minute or two the server appears under **Operate → Servers** in
 Intersight.
 
 You can now unplug the serial cable and move to the next server.
+
+---
+
+## Optional — Boot a firmware ISO (HUU) via vMedia
+
+The script can also point the server at a firmware ISO (for example, the Cisco
+**HUU** — Host Upgrade Utility) by mapping it as CIMC virtual media and putting
+it first in the boot order (local LUN second), then power-cycling so the server
+boots the ISO. You then complete the firmware update from the HUU screen (over
+the CIMC KVM or console) — the script's job is to get the server booted to the
+ISO.
+
+### How the CIMC reaches the ISO (read this first)
+
+The CIMC reads virtual media over its **management IP network — not over the
+serial cable.** So an ISO "on your laptop" has to be served over IP, and the
+CIMC must be able to reach your laptop. The recommended setup is:
+
+- **Serial console** to the SERIAL jack (for configuration), **and**
+- **Ethernet** from your laptop to the CIMC management port (so the CIMC can
+  pull the ISO).
+
+Because a direct laptop-to-CIMC Ethernet link has no DHCP, give that laptop
+Ethernet interface a **static IPv4 in the CIMC's subnet**:
+
+- Use the same subnet/mask as the CIMC (from your `"site"` settings).
+- Pick a free address that is **not** the CIMC IP and **not** the gateway.
+- Example: if the CIMC is `10.10.20.51 / 255.255.255.0`, set the laptop
+  Ethernet to something like `10.10.20.9 / 255.255.255.0`.
+- Allow inbound connections on the serve port (default `8000`) through your
+  laptop's firewall.
+
+The script auto-detects the laptop IP that is on the CIMC's subnet, so you
+normally don't need to set `serveHost` — just make sure that Ethernet interface
+has an address in the right subnet.
+
+> If you can't put the laptop on the CIMC network, host the ISO on an existing
+> web server instead and use `"transport": "url"` with `"shareUrl"` (below).
+
+### Configure the `"firmware"` block
+
+Put the ISO in a folder on your laptop, then edit the `"firmware"` block in
+`cimc-config.jsonc`:
+
+```jsonc
+"firmware": {
+    "enabled":        false,            // or pass -Firmware on the command line
+    "transport":      "http-local",     // "http-local" serves from your laptop; "url" uses a hosted share
+    "isoFolder":      "/Users/you/Desktop/firmware",
+    "isoFile":        "ucs-c220m7-huu.iso",
+    "serveHost":      null,              // null = auto-detect the NIC on the CIMC subnet
+    "servePort":      8000,
+    "shareUrl":       null,              // for transport "url", e.g. "http://10.10.10.9/iso/"
+    "shareUser":      null,
+    "sharePassword":  null,
+    "vmediaVolume":   "firmware",
+    "vmediaSubtype":  "CIMCMAPPEDDVD",   // CIMC-mapped vDVD subtype
+    "dvdBootName":    "vDVD",            // boot device #1
+    "localBootName":  "LocalLUN",        // boot device #2
+    "localBootType":  "LOCALHDD",
+    "powerCycle":     true               // power-cycle to boot the ISO
+}
+```
+
+### Run it
+
+Enable the firmware step either by setting `"enabled": true`, or by adding
+`-Firmware` (with optional `-IsoFolder` / `-IsoFile` overrides) to the normal
+run command:
+
+```bash
+pwsh -NoProfile -File ./Configure-CIMC.ps1 -ComPort /dev/cu.usbserial-10 -HostName rack01-ucs01 \
+    -Firmware -IsoFolder ~/Desktop/firmware -IsoFile ucs-c220m7-huu.iso
+```
+
+On Windows:
+
+```powershell
+.\Configure-CIMC.ps1 -ComPort COM3 -HostName rack01-ucs01 -Firmware -IsoFolder C:\firmware -IsoFile ucs-c220m7-huu.iso
+```
+
+The script maps the ISO, verifies the mapping status, sets the boot order,
+power-cycles the server, and then **keeps the local HTTP server running** while
+the CIMC reads the media. **Leave the script window open** until the firmware
+update is finished — press **Enter** in the script only when you're done, which
+stops serving the ISO.
+
+> **Note:** the exact CIMC CLI tokens for the vMedia boot subtype, the local
+> LUN device type, and the power-cycle command can vary by firmware version. If
+> the log shows one of these was rejected, adjust `vmediaSubtype`,
+> `localBootType`, etc. in the `"firmware"` block and re-run. The session log
+> under `logs/` records exactly what the CIMC returned.
 
 ---
 
