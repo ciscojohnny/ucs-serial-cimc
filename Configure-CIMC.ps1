@@ -444,6 +444,64 @@ function Send-CimcConfirm {
     return $resp
 }
 
+function Sync-CimcPrompt {
+    <#
+        Get the reader back in step with the console. Discards buffered text and
+        nudges with Enter until the '#' prompt comes back, so a read that has
+        drifted a prompt behind (or a momentarily quiet console) cannot starve
+        the next command. Returns $true when we end at a prompt.
+
+        Deliberately does NOT send the ESC+9 wake sequence: that is for a parked
+        PRE-LOGIN console and would switch the serial port away mid-session.
+    #>
+    param(
+        [Parameter(Mandatory)][System.IO.Ports.SerialPort]$Port,
+        [int]$Attempts = 3,
+        [int]$TimeoutSec = 5
+    )
+    for ($i = 0; $i -lt $Attempts; $i++) {
+        try { $Port.DiscardInBuffer() } catch {}
+        try {
+            $Port.Write("`r")
+            $resp = Read-Until -Port $Port -Patterns @($script:RxCli) -TimeoutSec $TimeoutSec
+            if ($resp -match $script:RxCli) { return $true }
+        } catch {}
+    }
+    return $false
+}
+
+function Send-CimcBestEffort {
+    <#
+        Send an OPTIONAL command. If the console answers nothing before the
+        timeout, log a warning, resync the prompt and carry on rather than
+        throwing. Use this for settings that must never abort a run whose real
+        configuration has already been committed.
+
+        Input is drained first so a stale prompt left over from a previous
+        command cannot satisfy this command's read (that drift is what starved
+        the Device Connector settings on C220 M7N).
+
+        Returns the console text, or $null when the command produced no reply.
+    #>
+    param(
+        [Parameter(Mandatory)][System.IO.Ports.SerialPort]$Port,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Command,
+        [int]$TimeoutSec = 20,
+        [int]$InterDelayMs = 250
+    )
+    try { $Port.DiscardInBuffer() } catch {}
+    try {
+        return (Send-CimcConfirm -Port $Port -Command $Command -TimeoutSec $TimeoutSec -InterDelayMs $InterDelayMs)
+    }
+    catch {
+        Write-Log -Level WARN "No console reply to '$Command' within ${TimeoutSec}s; treating it as optional and continuing."
+        if (-not (Sync-CimcPrompt -Port $Port)) {
+            Write-Log -Level WARN 'Could not resync the CIMC prompt after the silent command.'
+        }
+        return $null
+    }
+}
+
 function Invoke-PasswordChange {
     <#
         Drives the CIMC forced password-change dialog. Can be entered either
@@ -896,21 +954,45 @@ function Enable-IntersightDeviceConnector {
         Send-Command -Port $Port -Command 'scope device-connector' -ExpectPatterns @('#\s*$','Invalid scope') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
     }
 
-    Send-CimcConfirm -Port $Port -Command 'set enabled yes'            -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-    Send-Command -Port $Port -Command 'set read-only-mode no'          -ExpectPatterns @('#\s*$','Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-    Send-Command -Port $Port -Command 'set tunneled-kvm-enabled yes'   -ExpectPatterns @('#\s*$','Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-    Send-Command -Port $Port -Command 'set auto-update-enabled yes'    -ExpectPatterns @('#\s*$','Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+    # Observed on C220 M7N: this scope answers these 'set' commands faster than
+    # the reader consumes them, so reads drift a prompt behind and the last one
+    # starves with an empty buffer. Resync first, then send each setting
+    # best-effort so a silent console cannot fail an otherwise-complete run.
+    Sync-CimcPrompt -Port $Port | Out-Null
+
+    Send-CimcBestEffort -Port $Port -Command 'set enabled yes'              -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+    Send-CimcBestEffort -Port $Port -Command 'set read-only-mode no'        -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+    Send-CimcBestEffort -Port $Port -Command 'set tunneled-kvm-enabled yes' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+    Send-CimcBestEffort -Port $Port -Command 'set auto-update-enabled yes'  -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
 
     if ($Config.intersight.proxyHost) {
-        Send-Command -Port $Port -Command 'set proxy-enabled yes' -ExpectPatterns @('#\s*$','Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-        Send-Command -Port $Port -Command ("set proxy-host {0}" -f $Config.intersight.proxyHost) -ExpectPatterns @('#\s*$','Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+        Send-CimcBestEffort -Port $Port -Command 'set proxy-enabled yes' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+        Send-CimcBestEffort -Port $Port -Command ("set proxy-host {0}" -f $Config.intersight.proxyHost) -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
         if ($Config.intersight.proxyPort) {
-            Send-Command -Port $Port -Command ("set proxy-port {0}" -f [int]$Config.intersight.proxyPort) -ExpectPatterns @('#\s*$','Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+            Send-CimcBestEffort -Port $Port -Command ("set proxy-port {0}" -f [int]$Config.intersight.proxyPort) -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
         }
     }
 
-    Send-CimcConfirm -Port $Port -Command 'commit' -TimeoutSec 30 -InterDelayMs $delayMs | Out-Null
+    # The settings above are only staged until this commit lands, so retry it
+    # once after a resync before giving up.
+    try {
+        Send-CimcConfirm -Port $Port -Command 'commit' -TimeoutSec 30 -InterDelayMs $delayMs | Out-Null
+    }
+    catch {
+        Write-Log -Level WARN "Device Connector commit did not confirm: $($_.Exception.Message)"
+        Sync-CimcPrompt -Port $Port | Out-Null
+        Send-CimcBestEffort -Port $Port -Command 'commit' -TimeoutSec 30 -InterDelayMs $delayMs | Out-Null
+    }
 
+    # Report the resulting state so the operator knows whether the Device
+    # Connector still needs enabling by hand before claiming in Intersight.
+    $state = Send-CimcBestEffort -Port $Port -Command 'show detail' -TimeoutSec $cmdTO -InterDelayMs $delayMs
+    if ($state -match '(?i)Enabled\s*:\s*yes') {
+        Write-Log 'Intersight Device Connector reports Enabled: yes.'
+    }
+    else {
+        Write-Log -Level WARN 'Could not confirm the Device Connector is enabled. Check Admin > Device Connector in the CIMC UI before claiming in Intersight.'
+    }
 }
 
 # -------------------- Firmware upgrade via CIMC-mapped vMedia --------------------
@@ -1252,7 +1334,14 @@ function Invoke-ConfigureServer {
                                    -PrimaryDns $dns1 -SecondaryDns $dns2 -DnsDomain $domain
         Start-Sleep -Seconds 3
         Set-CimcNtp                -Port $script:Port -Config $Config -NtpServers $ntp
-        Enable-IntersightDeviceConnector -Port $script:Port -Config $Config
+        # Everything above is already committed, so a hiccup here must not fail
+        # the whole run. Report it and continue to the firmware step / logout.
+        try {
+            Enable-IntersightDeviceConnector -Port $script:Port -Config $Config
+        }
+        catch {
+            Write-Log -Level WARN "Intersight Device Connector step did not complete: $($_.Exception.Message). All other configuration was committed; enable it from Admin > Device Connector if needed."
+        }
         if ($script:FirmwareEnabled) {
             Write-Log 'Firmware step enabled: mapping ISO via vMedia and setting boot order.'
             Invoke-FirmwareUpgrade -Port $script:Port -Config $Config -TargetIp $ip
