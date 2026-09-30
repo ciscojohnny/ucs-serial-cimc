@@ -1178,28 +1178,45 @@ function Set-CimcVmediaMap {
     }
 
     Write-Log "Mapping vMedia volume '$Volume' -> ${BaseUrl}${IsoFile}"
-    # map-www {volume-name} {remote-share} {remote-file}
+    # Only a real prompt ends this wait. A bare "Error"/"Invalid" match returns
+    # before CIMC has finished contacting the HTTP server, and the next command
+    # is then typed into a busy CLI that never echoes it.
+    $mapExpect = @($script:RxCli, '(?i)user\s*name:\s*$', '(?i)password:\s*$')
     $resp = Send-Command -Port $Port -Command ("map-www {0} {1} {2}" -f $Volume, $BaseUrl, $IsoFile) `
-        -ExpectPatterns @('#\s*$', '(?i)user\s*name:\s*$', '(?i)password:\s*$', 'Invalid', 'Error') `
-        -TimeoutSec $cmdTO -InterDelayMs $delayMs
+        -ExpectPatterns $mapExpect -TimeoutSec $cmdTO -InterDelayMs $delayMs
 
-    # map-www may prompt for credentials; answer with provided creds or blanks.
+    # map-www asks for credentials even on an open HTTP share. Blank Enter is
+    # correct when shareUser/sharePassword are not set. Check the password
+    # prompt first: the buffer can contain both lines and ends on the later one.
     $guard = 4
-    while ($guard-- -gt 0 -and ($resp -match '(?i)user\s*name:\s*$' -or $resp -match '(?i)password:\s*$')) {
-        if ($resp -match '(?i)user\s*name:\s*$') {
-            $resp = Send-Command -Port $Port -Command ([string]$User) `
-                -ExpectPatterns @('#\s*$', '(?i)password:\s*$', 'Invalid', 'Error') -TimeoutSec $cmdTO -InterDelayMs $delayMs
-        }
-        elseif ($resp -match '(?i)password:\s*$') {
+    while ($guard-- -gt 0 -and $resp -notmatch $script:RxCli -and ($resp -match '(?i)user\s*name:\s*$' -or $resp -match '(?i)password:\s*$')) {
+        if ($resp -match '(?i)password:\s*$') {
+            Write-Log 'map-www password prompt; sending configured password or a blank Enter.'
             $resp = Send-Command -Port $Port -Command ([string]$Pass) `
-                -ExpectPatterns @('#\s*$', 'Invalid', 'Error') -TimeoutSec $cmdTO -InterDelayMs $delayMs -Sensitive
+                -ExpectPatterns $mapExpect -TimeoutSec 60 -InterDelayMs $delayMs -Sensitive
+        }
+        elseif ($resp -match '(?i)user\s*name:\s*$') {
+            Write-Log 'map-www username prompt; sending configured username or a blank Enter.'
+            $resp = Send-Command -Port $Port -Command ([string]$User) `
+                -ExpectPatterns $mapExpect -TimeoutSec 60 -InterDelayMs $delayMs
         }
     }
 
-    # Give the CIMC a moment to fetch headers, then verify.
-    Start-Sleep -Seconds 3
+    # CIMC contacts the HTTP server before it returns to '#'. That can take
+    # longer than a normal command when the path is slow or firewalled.
+    if ($resp -notmatch $script:RxCli) {
+        Write-Log 'Waiting for CIMC to finish contacting the HTTP share...'
+        try {
+            $resp = Read-Until -Port $Port -Patterns @($script:RxCli) -TimeoutSec 90
+        }
+        catch {
+            throw "CIMC did not return to a prompt after map-www. It may be unable to reach $BaseUrl from the CIMC management IP. Allow Python through Windows Firewall on the laptop Ethernet NIC that faces the CIMC."
+        }
+    }
+
+    Start-Sleep -Seconds 2
     $status = Send-Command -Port $Port -Command 'show mappings detail' `
-        -ExpectPatterns @('#\s*$') -TimeoutSec $cmdTO -InterDelayMs $delayMs
+        -ExpectPatterns @($script:RxCli) -TimeoutSec 45 -InterDelayMs $delayMs
 
     if ($status -match '(?i)Map-Status\s*:\s*OK' -or $status -match "(?i)$([regex]::Escape($Volume))\s+OK") {
         Write-Log "vMedia mapping '$Volume' reported Map-Status OK."
