@@ -1161,7 +1161,18 @@ function Set-CimcVmediaMap {
     Send-Command -Port $Port -Command 'scope vmedia' -ExpectPatterns @('#\s*$','Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
 
     # Remove any pre-existing volume with the same name so re-runs are clean.
-    Send-CimcConfirm -Port $Port -Command "unmap $Volume" -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+    # CIMC does not use the usual [y/N] prompt here. It asks:
+    #   Save mapping? Enter 'yes' or 'no' to confirm (CTRL-C to cancel) -->
+    # 'no' drops the saved mapping so map-www can recreate the volume.
+    $unmap = Send-Command -Port $Port -Command "unmap $Volume" `
+        -ExpectPatterns @($script:RxCli, "(?i)enter 'yes' or 'no'", '(?i)does not exist', '(?i)not found', '(?i)invalid') `
+        -TimeoutSec $cmdTO -InterDelayMs $delayMs
+    if ($unmap -match "(?i)enter 'yes' or 'no'" -and $unmap -notmatch $script:RxCli) {
+        Write-Log 'Unmap asked whether to save the mapping; answering "no" so the old volume is removed.'
+        Send-Command -Port $Port -Command 'no' `
+            -ExpectPatterns @($script:RxCli, '(?i)error', '(?i)invalid') `
+            -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+    }
 
     Write-Log "Mapping vMedia volume '$Volume' -> ${BaseUrl}${IsoFile}"
     # map-www {volume-name} {remote-share} {remote-file}
