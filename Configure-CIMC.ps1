@@ -1068,11 +1068,14 @@ function Get-ServeHostAddress {
 }
 
 function Start-IsoHttpServer {
-    # Serve $Folder over HTTP on $Port using Python's built-in server. Returns
-    # the running Process object (kept alive until the upgrade finishes).
+    # Serve $Folder over HTTP on $ListenPort using Python's built-in server.
+    # The parameter is NOT named Port: PowerShell variable names are
+    # case-insensitive, so $Port would collide with the serial-port object and
+    # the HTTP listener would be handed a SerialPort instead of an integer.
+    # Returns the running Process object (kept alive until the upgrade finishes).
     param(
         [Parameter(Mandatory)][string]$Folder,
-        [Parameter(Mandatory)][int]$Port
+        [Parameter(Mandatory)][int]$ListenPort
     )
     if (-not (Test-Path -LiteralPath $Folder)) {
         throw "Firmware folder not found: '$Folder'."
@@ -1083,10 +1086,10 @@ function Start-IsoHttpServer {
         throw "python3 is required to serve the ISO locally (transport 'http-local'). Install Python 3, or set firmware.transport to 'url' and provide firmware.shareUrl."
     }
     $full = (Resolve-Path -LiteralPath $Folder).Path
-    Write-Log "Starting local HTTP server: folder='$full' port=$Port (python: $($python.Source))"
+    Write-Log "Starting local HTTP server: folder='$full' port=$ListenPort (python: $($python.Source))"
     $psi = [System.Diagnostics.ProcessStartInfo]::new()
     $psi.FileName               = $python.Source
-    $psi.Arguments              = "-m http.server $Port --bind 0.0.0.0"
+    $psi.Arguments              = "-m http.server $ListenPort --bind 0.0.0.0"
     $psi.WorkingDirectory       = $full
     $psi.UseShellExecute        = $false
     $psi.RedirectStandardOutput = $true
@@ -1094,7 +1097,7 @@ function Start-IsoHttpServer {
     $proc = [System.Diagnostics.Process]::Start($psi)
     Start-Sleep -Seconds 1
     if ($proc.HasExited) {
-        throw "Local HTTP server exited immediately (is port $Port already in use?)."
+        throw "Local HTTP server exited immediately (is port $ListenPort already in use?)."
     }
     return $proc
 }
@@ -1229,7 +1232,9 @@ function Invoke-CimcPowerCycle {
 
 function Invoke-FirmwareUpgrade {
     param(
-        [Parameter(Mandatory)][System.IO.Ports.SerialPort]$Port,
+        # Named SerialPort, not Port. $port is the same variable as $Port in
+        # PowerShell, and this function also needs an HTTP listen port.
+        [Parameter(Mandatory)][System.IO.Ports.SerialPort]$SerialPort,
         [Parameter(Mandatory)][object]$Config,
         [string]$TargetIp
     )
@@ -1239,9 +1244,9 @@ function Invoke-FirmwareUpgrade {
     $isoFolder = if ($script:IsoFolderOverride) { $script:IsoFolderOverride } elseif ($fw.isoFolder) { [string]$fw.isoFolder } else { $null }
     $isoFile   = if ($script:IsoFileOverride)   { $script:IsoFileOverride }   elseif ($fw.isoFile)   { [string]$fw.isoFile }   else { $null }
     $transport = if ($fw.transport) { [string]$fw.transport } else { 'http-local' }
-    $volume    = if ($fw.vmediaVolume) { [string]$fw.vmediaVolume } else { 'firmware' }
-    $port      = if ($fw.servePort) { [int]$fw.servePort } else { 8000 }
-    $powerCyc  = if ($fw.PSObject.Properties.Name -contains 'powerCycle') { [bool]$fw.powerCycle } else { $true }
+    $volume     = if ($fw.vmediaVolume) { [string]$fw.vmediaVolume } else { 'firmware' }
+    $listenPort = if ($fw.servePort) { [int]$fw.servePort } else { 8000 }
+    $powerCyc   = if ($fw.PSObject.Properties.Name -contains 'powerCycle') { [bool]$fw.powerCycle } else { $true }
 
     if (-not $isoFile) { throw 'Firmware step is enabled but no ISO file name was provided (firmware.isoFile or -IsoFile).' }
 
@@ -1255,25 +1260,25 @@ function Invoke-FirmwareUpgrade {
             }
             $serveHost = Get-ServeHostAddress -Override ([string]$fw.serveHost) -TargetIp $TargetIp -SubnetMask ([string]$Config.site.subnetMask)
             if (-not $serveHost) { throw 'Could not determine a local IP to serve the ISO from. Set firmware.serveHost explicitly.' }
-            $server  = Start-IsoHttpServer -Folder $isoFolder -Port $port
-            $baseUrl = "http://${serveHost}:${port}/"
-            Write-Log "Serving ISO to CIMC at ${baseUrl}${isoFile} (the CIMC's IP must be able to reach ${serveHost}:${port})."
-            Set-CimcVmediaMap -Port $Port -Config $Config -Volume $volume -BaseUrl $baseUrl -IsoFile $isoFile `
+            $server  = Start-IsoHttpServer -Folder $isoFolder -ListenPort $listenPort
+            $baseUrl = "http://${serveHost}:${listenPort}/"
+            Write-Log "Serving ISO to CIMC at ${baseUrl}${isoFile} (the CIMC's IP must be able to reach ${serveHost}:${listenPort})."
+            Set-CimcVmediaMap -Port $SerialPort -Config $Config -Volume $volume -BaseUrl $baseUrl -IsoFile $isoFile `
                 -User ([string]$fw.shareUser) -Pass ([string]$fw.sharePassword) | Out-Null
         }
         elseif ($transport -ieq 'url') {
             $baseUrl = [string]$fw.shareUrl
             if (-not $baseUrl) { throw 'firmware.transport is "url" but firmware.shareUrl is not set.' }
             if ($baseUrl[-1] -ne '/') { $baseUrl += '/' }
-            Set-CimcVmediaMap -Port $Port -Config $Config -Volume $volume -BaseUrl $baseUrl -IsoFile $isoFile `
+            Set-CimcVmediaMap -Port $SerialPort -Config $Config -Volume $volume -BaseUrl $baseUrl -IsoFile $isoFile `
                 -User ([string]$fw.shareUser) -Pass ([string]$fw.sharePassword) | Out-Null
         }
         else {
             throw "Unknown firmware.transport '$transport' (expected 'http-local' or 'url')."
         }
 
-        Set-CimcVmediaBootOrder -Port $Port -Config $Config -Fw $fw
-        if ($powerCyc) { Invoke-CimcPowerCycle -Port $Port -Config $Config }
+        Set-CimcVmediaBootOrder -Port $SerialPort -Config $Config -Fw $fw
+        if ($powerCyc) { Invoke-CimcPowerCycle -Port $SerialPort -Config $Config }
 
         if ($server) {
             Write-Host ''
@@ -1344,7 +1349,7 @@ function Invoke-ConfigureServer {
         }
         if ($script:FirmwareEnabled) {
             Write-Log 'Firmware step enabled: mapping ISO via vMedia and setting boot order.'
-            Invoke-FirmwareUpgrade -Port $script:Port -Config $Config -TargetIp $ip
+            Invoke-FirmwareUpgrade -SerialPort $script:Port -Config $Config -TargetIp $ip
         }
         Invoke-CimcLogout          -Port $script:Port
         Write-Log "===== Finished configuration for $hn ($ip) ====="
