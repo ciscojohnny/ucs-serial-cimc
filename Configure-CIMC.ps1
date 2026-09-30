@@ -1067,6 +1067,29 @@ function Get-ServeHostAddress {
     } catch { return $null }
 }
 
+function Resolve-PythonCommand {
+    # Prefer a real interpreter. On Windows, "python" and "python3" often resolve
+    # to the Microsoft Store app-execution alias under WindowsApps. That stub
+    # starts and exits immediately, which looks like a failed HTTP server.
+    $stubs = @()
+    foreach ($name in @('py','python','python3')) {
+        $cmds = @(Get-Command $name -All -ErrorAction SilentlyContinue)
+        foreach ($cmd in $cmds) {
+            $src = [string]$cmd.Source
+            if (-not $src) { continue }
+            if ($src -match '(?i)\\WindowsApps\\python') {
+                $stubs += $src
+                continue
+            }
+            return $cmd
+        }
+    }
+    if ($stubs.Count -gt 0) {
+        throw ("Python on PATH is only the Windows Store shortcut ({0}), which exits immediately and cannot serve the ISO. Install Python 3 from https://www.python.org/downloads/ and enable 'Add python.exe to PATH', then open a new PowerShell window. You can also turn off the python.exe and python3.exe App execution aliases under Settings > Apps > Advanced app settings." -f $stubs[0])
+    }
+    throw "Python 3 is required to serve the ISO locally. Install it from https://www.python.org/downloads/ or set firmware.transport to 'url' and provide firmware.shareUrl."
+}
+
 function Start-IsoHttpServer {
     # Serve $Folder over HTTP on $ListenPort using Python's built-in server.
     # The parameter is NOT named Port: PowerShell variable names are
@@ -1080,16 +1103,17 @@ function Start-IsoHttpServer {
     if (-not (Test-Path -LiteralPath $Folder)) {
         throw "Firmware folder not found: '$Folder'."
     }
-    $python = Get-Command python3 -ErrorAction SilentlyContinue
-    if (-not $python) { $python = Get-Command python -ErrorAction SilentlyContinue }
-    if (-not $python) {
-        throw "python3 is required to serve the ISO locally (transport 'http-local'). Install Python 3, or set firmware.transport to 'url' and provide firmware.shareUrl."
-    }
+    $python = Resolve-PythonCommand
     $full = (Resolve-Path -LiteralPath $Folder).Path
+    $pyArgs = if ([System.IO.Path]::GetFileName($python.Source) -ieq 'py.exe') {
+        "-3 -m http.server $ListenPort --bind 0.0.0.0"
+    } else {
+        "-m http.server $ListenPort --bind 0.0.0.0"
+    }
     Write-Log "Starting local HTTP server: folder='$full' port=$ListenPort (python: $($python.Source))"
     $psi = [System.Diagnostics.ProcessStartInfo]::new()
     $psi.FileName               = $python.Source
-    $psi.Arguments              = "-m http.server $ListenPort --bind 0.0.0.0"
+    $psi.Arguments              = $pyArgs
     $psi.WorkingDirectory       = $full
     $psi.UseShellExecute        = $false
     $psi.RedirectStandardOutput = $true
@@ -1097,8 +1121,16 @@ function Start-IsoHttpServer {
     $proc = [System.Diagnostics.Process]::Start($psi)
     Start-Sleep -Seconds 1
     if ($proc.HasExited) {
-        throw "Local HTTP server exited immediately (is port $ListenPort already in use?)."
+        $detail = ''
+        try { $detail = (($proc.StandardError.ReadToEnd() + ' ' + $proc.StandardOutput.ReadToEnd()).Trim()) } catch {}
+        if (-not $detail) {
+            $detail = "Check that Python 3 is really installed (not the Windows Store alias) and that TCP port $ListenPort is free."
+        }
+        throw "Local HTTP server exited immediately (exit code $($proc.ExitCode)). $detail"
     }
+    # Drain the pipes so a long ISO download cannot fill them and stall Python.
+    try { $proc.BeginOutputReadLine() } catch {}
+    try { $proc.BeginErrorReadLine() } catch {}
     return $proc
 }
 
