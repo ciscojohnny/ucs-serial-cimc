@@ -1374,15 +1374,17 @@ function Invoke-FirmwareUpgrade {
             $serveHost = Get-ServeHostAddress -Override ([string]$fw.serveHost) -TargetIp $TargetIp -SubnetMask ([string]$Config.site.subnetMask)
             if (-not $serveHost) { throw 'Could not determine a local IP to serve the ISO from. Set firmware.serveHost explicitly.' }
             $server  = Start-IsoHttpServer -Folder $isoFolder -ListenPort $listenPort
-            $baseUrl = "http://${serveHost}:${listenPort}/"
-            Write-Log "Serving ISO to CIMC at ${baseUrl}${isoFile} (the CIMC's IP must be able to reach ${serveHost}:${listenPort})."
+            # No trailing slash. CIMC inserts one when it joins the share and the
+            # filename, so a share of "http://host:8000/" becomes "http://host:8000//file".
+            # Python on Windows treats a leading "//" as a UNC path and the mount fails.
+            $baseUrl = "http://${serveHost}:${listenPort}"
+            Write-Log "Serving ISO to CIMC at ${baseUrl}/${isoFile} (the CIMC's IP must be able to reach ${serveHost}:${listenPort})."
             Set-CimcVmediaMap -Port $SerialPort -Config $Config -Volume $volume -BaseUrl $baseUrl -IsoFile $isoFile `
                 -User ([string]$fw.shareUser) -Pass ([string]$fw.sharePassword) | Out-Null
         }
         elseif ($transport -ieq 'url') {
-            $baseUrl = [string]$fw.shareUrl
+            $baseUrl = ([string]$fw.shareUrl).TrimEnd('/')
             if (-not $baseUrl) { throw 'firmware.transport is "url" but firmware.shareUrl is not set.' }
-            if ($baseUrl[-1] -ne '/') { $baseUrl += '/' }
             Set-CimcVmediaMap -Port $SerialPort -Config $Config -Volume $volume -BaseUrl $baseUrl -IsoFile $isoFile `
                 -User ([string]$fw.shareUser) -Pass ([string]$fw.sharePassword) | Out-Null
         }
