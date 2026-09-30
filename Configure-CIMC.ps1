@@ -1259,21 +1259,18 @@ function Set-CimcVmediaMap {
     $resp = Read-CimcSettle -Port $Port -TimeoutSec $cmdTO -QuietMs 8000
     Write-CimcTail -Text $resp
 
-    # Blank Enter is correct for Python's open HTTP server. Answer password as
-    # well as username; CIMC asks for both even when the share has no login.
-    # Do not send another command until the password has been answered. A
-    # reprinted '#' after "Password:" is still the password question.
-    $answeredPass = $false
+    # Python's HTTP server has no login. This CIMC asks "Server username:" and,
+    # after a blank Enter, returns straight to "/vmedia #" with no password
+    # question. Other builds ask for both. Answer whichever prompts appear, and
+    # stop when the CLI prompt is back and no credential question is in the text.
     $guard = 6
     while ($guard-- -gt 0) {
         $kind = Get-CimcPromptKind -Text $resp
         if ($kind -eq 'password') {
-            if ($answeredPass) { break }
             Write-Log 'map-www password prompt; sending configured password or a blank Enter.'
             $shownPass = if ([string]::IsNullOrEmpty($Pass)) { '<blank>' } else { '<redacted>' }
             Write-Log -Level TX -Message "-> $shownPass"
             $Port.WriteLine([string]$Pass)
-            $answeredPass = $true
         }
         elseif ($kind -eq 'username') {
             Write-Log 'map-www username prompt; sending configured username or a blank Enter.'
@@ -1281,12 +1278,9 @@ function Set-CimcVmediaMap {
             Write-Log -Level TX -Message "-> $shown"
             $Port.WriteLine([string]$User)
         }
-        elseif (-not $answeredPass) {
-            Write-Log 'Password prompt not visible yet; waiting before sending another command.'
-            $resp = Read-CimcSettle -Port $Port -TimeoutSec 30 -QuietMs 8000
-            Write-CimcTail -Text $resp
-            if ((Get-CimcPromptKind -Text $resp) -eq 'password') { continue }
-            throw "map-www did not ask for a password, so the mapping was not completed. Check the 'CIMC said:' line above."
+        elseif ($kind -eq 'cli') {
+            Write-Log 'map-www returned to the CLI prompt.'
+            break
         }
         else { break }
         Start-Sleep -Milliseconds $delayMs
