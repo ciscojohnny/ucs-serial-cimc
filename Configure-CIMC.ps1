@@ -1167,7 +1167,11 @@ function Read-CimcSettle {
     param(
         [Parameter(Mandatory)][System.IO.Ports.SerialPort]$Port,
         [int]$TimeoutSec = 90,
-        [int]$QuietMs = 2000
+        # A '#' prompt is accepted only after this long with no more bytes.
+        # map-www reprints '#' and then asks for a password a few seconds later.
+        [int]$QuietMs = 8000,
+        # Username/password prompts are accepted quickly once they have arrived.
+        [int]$PromptQuietMs = 400
     )
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $lastRx = [System.Diagnostics.Stopwatch]::StartNew()
@@ -1189,9 +1193,13 @@ function Read-CimcSettle {
         if ($got) { $lastRx.Restart() }
         else { Start-Sleep -Milliseconds 100 }
 
-        if (-not $saw -or $lastRx.ElapsedMilliseconds -lt $QuietMs) { continue }
+        if (-not $saw) { continue }
         $kind = Get-CimcPromptKind -Text $buffer.ToString()
-        if ($kind) { return $buffer.ToString() }
+        $quiet = $lastRx.ElapsedMilliseconds
+        if (($kind -eq 'username' -or $kind -eq 'password' -or $kind -eq 'save') -and $quiet -ge $PromptQuietMs) {
+            return $buffer.ToString()
+        }
+        if ($kind -eq 'cli' -and $quiet -ge $QuietMs) { return $buffer.ToString() }
     }
     $tail = $buffer.ToString()
     if ($tail.Length -gt 200) { $tail = $tail.Substring($tail.Length - 200) }
@@ -1229,12 +1237,12 @@ function Set-CimcVmediaMap {
             -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
     }
 
-    Write-Log "Mapping vMedia volume '$Volume' -> ${BaseUrl}${IsoFile}"
+    Write-Log "Mapping vMedia volume '$Volume' -> map-www $Volume $BaseUrl $IsoFile"
     $mapCmd = "map-www {0} {1} {2}" -f $Volume, $BaseUrl, $IsoFile
     Write-Log -Level TX -Message "-> $mapCmd"
     $Port.WriteLine($mapCmd)
     Start-Sleep -Milliseconds $delayMs
-    $resp = Read-CimcSettle -Port $Port -TimeoutSec $cmdTO -QuietMs 2000
+    $resp = Read-CimcSettle -Port $Port -TimeoutSec $cmdTO -QuietMs 8000
 
     # Blank Enter is correct for Python's open HTTP server. Answer password as
     # well as username; CIMC asks for both even when the share has no login.
@@ -1256,7 +1264,7 @@ function Set-CimcVmediaMap {
         else { break }
         Start-Sleep -Milliseconds $delayMs
         # Mount attempt can block the CLI while CIMC contacts the laptop.
-        $resp = Read-CimcSettle -Port $Port -TimeoutSec 90 -QuietMs 2000
+        $resp = Read-CimcSettle -Port $Port -TimeoutSec 90 -QuietMs 8000
     }
 
     if ((Get-CimcPromptKind -Text $resp) -ne 'cli') {
