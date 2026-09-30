@@ -1147,15 +1147,28 @@ function Stop-IsoHttpServer {
 }
 
 function Get-CimcPromptKind {
-    # Classify the END of a serial buffer. Credential prompts win over a '#'
-    # that was reprinted on an earlier line.
+    # A trailing '#' is not proof the CLI is ready. map-www prints
+    # "Password:" and then reprints "hostname /vmedia #" on the next line.
+    # The credential question has to win, or the next command is typed into
+    # the password field and the mapping is abandoned.
     param([string]$Text)
     $flat = $Text -replace "`r", ''
     if ($flat -match "(?i)enter 'yes' or 'no'") { return 'save' }
-    if ($flat -match '(?i)password:\s*$') { return 'password' }
-    if ($flat -match '(?i)user\s*name:\s*$') { return 'username' }
+    $pass = [regex]::Matches($flat, '(?i)password\s*:')
+    $user = [regex]::Matches($flat, '(?i)user\s*name\s*:')
+    $passAt = if ($pass.Count -gt 0) { $pass[$pass.Count - 1].Index } else { -1 }
+    $userAt = if ($user.Count -gt 0) { $user[$user.Count - 1].Index } else { -1 }
+    if ($passAt -ge 0 -and $passAt -ge $userAt) { return 'password' }
+    if ($userAt -ge 0) { return 'username' }
     if ($flat -match '#\s*$') { return 'cli' }
     return ''
+}
+
+function Write-CimcTail {
+    param([string]$Text)
+    $flat = ($Text -replace "[`r`n]+", ' | ').Trim()
+    if ($flat.Length -gt 240) { $flat = $flat.Substring($flat.Length - 240) }
+    if ($flat) { Write-Log "CIMC said: $flat" }
 }
 
 function Read-CimcSettle {
@@ -1201,6 +1214,7 @@ function Read-CimcSettle {
         }
         if ($kind -eq 'cli' -and $quiet -ge $QuietMs) { return $buffer.ToString() }
     }
+    Write-CimcTail -Text $buffer.ToString()
     $tail = $buffer.ToString()
     if ($tail.Length -gt 200) { $tail = $tail.Substring($tail.Length - 200) }
     throw "Timeout waiting for a settled CIMC prompt. Last 200 chars: '$tail'"
@@ -1243,17 +1257,23 @@ function Set-CimcVmediaMap {
     $Port.WriteLine($mapCmd)
     Start-Sleep -Milliseconds $delayMs
     $resp = Read-CimcSettle -Port $Port -TimeoutSec $cmdTO -QuietMs 8000
+    Write-CimcTail -Text $resp
 
     # Blank Enter is correct for Python's open HTTP server. Answer password as
     # well as username; CIMC asks for both even when the share has no login.
-    $guard = 4
+    # Do not send another command until the password has been answered. A
+    # reprinted '#' after "Password:" is still the password question.
+    $answeredPass = $false
+    $guard = 6
     while ($guard-- -gt 0) {
         $kind = Get-CimcPromptKind -Text $resp
         if ($kind -eq 'password') {
+            if ($answeredPass) { break }
             Write-Log 'map-www password prompt; sending configured password or a blank Enter.'
             $shownPass = if ([string]::IsNullOrEmpty($Pass)) { '<blank>' } else { '<redacted>' }
             Write-Log -Level TX -Message "-> $shownPass"
             $Port.WriteLine([string]$Pass)
+            $answeredPass = $true
         }
         elseif ($kind -eq 'username') {
             Write-Log 'map-www username prompt; sending configured username or a blank Enter.'
@@ -1261,10 +1281,18 @@ function Set-CimcVmediaMap {
             Write-Log -Level TX -Message "-> $shown"
             $Port.WriteLine([string]$User)
         }
+        elseif (-not $answeredPass) {
+            Write-Log 'Password prompt not visible yet; waiting before sending another command.'
+            $resp = Read-CimcSettle -Port $Port -TimeoutSec 30 -QuietMs 8000
+            Write-CimcTail -Text $resp
+            if ((Get-CimcPromptKind -Text $resp) -eq 'password') { continue }
+            throw "map-www did not ask for a password, so the mapping was not completed. Check the 'CIMC said:' line above."
+        }
         else { break }
         Start-Sleep -Milliseconds $delayMs
         # Mount attempt can block the CLI while CIMC contacts the laptop.
         $resp = Read-CimcSettle -Port $Port -TimeoutSec 90 -QuietMs 8000
+        Write-CimcTail -Text $resp
     }
 
     if ((Get-CimcPromptKind -Text $resp) -ne 'cli') {
