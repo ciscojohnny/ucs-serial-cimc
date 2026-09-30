@@ -1146,6 +1146,58 @@ function Stop-IsoHttpServer {
     }
 }
 
+function Get-CimcPromptKind {
+    # Classify the END of a serial buffer. Credential prompts win over a '#'
+    # that was reprinted on an earlier line.
+    param([string]$Text)
+    $flat = $Text -replace "`r", ''
+    if ($flat -match "(?i)enter 'yes' or 'no'") { return 'save' }
+    if ($flat -match '(?i)password:\s*$') { return 'password' }
+    if ($flat -match '(?i)user\s*name:\s*$') { return 'username' }
+    if ($flat -match '#\s*$') { return 'cli' }
+    return ''
+}
+
+function Read-CimcSettle {
+    # Read until the console has been quiet. map-www reprints the '#' prompt and
+    # THEN asks for a password. Returning on the first '#' types the next
+    # command into that password field, so the ISO mapping is saved but never
+    # mounts. A credential prompt is accepted as soon as it is quiet; a CLI
+    # prompt is accepted only after QuietMs with no further bytes.
+    param(
+        [Parameter(Mandatory)][System.IO.Ports.SerialPort]$Port,
+        [int]$TimeoutSec = 90,
+        [int]$QuietMs = 2000
+    )
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $lastRx = [System.Diagnostics.Stopwatch]::StartNew()
+    $buffer = [System.Text.StringBuilder]::new()
+    $saw = $false
+    while ($sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
+        $got = $false
+        try {
+            if ($Port.BytesToRead -gt 0) {
+                $chunk = $Port.ReadExisting()
+                if ($chunk) {
+                    [void]$buffer.Append($chunk)
+                    Write-Log -Level RX -Message ($chunk -replace "[`r`n]+", ' | ')
+                    $got = $true
+                    $saw = $true
+                }
+            }
+        } catch {}
+        if ($got) { $lastRx.Restart() }
+        else { Start-Sleep -Milliseconds 100 }
+
+        if (-not $saw -or $lastRx.ElapsedMilliseconds -lt $QuietMs) { continue }
+        $kind = Get-CimcPromptKind -Text $buffer.ToString()
+        if ($kind) { return $buffer.ToString() }
+    }
+    $tail = $buffer.ToString()
+    if ($tail.Length -gt 200) { $tail = $tail.Substring($tail.Length - 200) }
+    throw "Timeout waiting for a settled CIMC prompt. Last 200 chars: '$tail'"
+}
+
 function Set-CimcVmediaMap {
     # Map the ISO into a CIMC vMedia volume and verify Map-Status is OK.
     param(
@@ -1178,45 +1230,43 @@ function Set-CimcVmediaMap {
     }
 
     Write-Log "Mapping vMedia volume '$Volume' -> ${BaseUrl}${IsoFile}"
-    # Only a real prompt ends this wait. A bare "Error"/"Invalid" match returns
-    # before CIMC has finished contacting the HTTP server, and the next command
-    # is then typed into a busy CLI that never echoes it.
-    $mapExpect = @($script:RxCli, '(?i)user\s*name:\s*$', '(?i)password:\s*$')
-    $resp = Send-Command -Port $Port -Command ("map-www {0} {1} {2}" -f $Volume, $BaseUrl, $IsoFile) `
-        -ExpectPatterns $mapExpect -TimeoutSec $cmdTO -InterDelayMs $delayMs
+    $mapCmd = "map-www {0} {1} {2}" -f $Volume, $BaseUrl, $IsoFile
+    Write-Log -Level TX -Message "-> $mapCmd"
+    $Port.WriteLine($mapCmd)
+    Start-Sleep -Milliseconds $delayMs
+    $resp = Read-CimcSettle -Port $Port -TimeoutSec $cmdTO -QuietMs 2000
 
-    # map-www asks for credentials even on an open HTTP share. Blank Enter is
-    # correct when shareUser/sharePassword are not set. Check the password
-    # prompt first: the buffer can contain both lines and ends on the later one.
+    # Blank Enter is correct for Python's open HTTP server. Answer password as
+    # well as username; CIMC asks for both even when the share has no login.
     $guard = 4
-    while ($guard-- -gt 0 -and $resp -notmatch $script:RxCli -and ($resp -match '(?i)user\s*name:\s*$' -or $resp -match '(?i)password:\s*$')) {
-        if ($resp -match '(?i)password:\s*$') {
+    while ($guard-- -gt 0) {
+        $kind = Get-CimcPromptKind -Text $resp
+        if ($kind -eq 'password') {
             Write-Log 'map-www password prompt; sending configured password or a blank Enter.'
-            $resp = Send-Command -Port $Port -Command ([string]$Pass) `
-                -ExpectPatterns $mapExpect -TimeoutSec 60 -InterDelayMs $delayMs -Sensitive
+            $shownPass = if ([string]::IsNullOrEmpty($Pass)) { '<blank>' } else { '<redacted>' }
+            Write-Log -Level TX -Message "-> $shownPass"
+            $Port.WriteLine([string]$Pass)
         }
-        elseif ($resp -match '(?i)user\s*name:\s*$') {
+        elseif ($kind -eq 'username') {
             Write-Log 'map-www username prompt; sending configured username or a blank Enter.'
-            $resp = Send-Command -Port $Port -Command ([string]$User) `
-                -ExpectPatterns $mapExpect -TimeoutSec 60 -InterDelayMs $delayMs
+            $shown = if ([string]::IsNullOrEmpty($User)) { '<blank>' } else { $User }
+            Write-Log -Level TX -Message "-> $shown"
+            $Port.WriteLine([string]$User)
         }
+        else { break }
+        Start-Sleep -Milliseconds $delayMs
+        # Mount attempt can block the CLI while CIMC contacts the laptop.
+        $resp = Read-CimcSettle -Port $Port -TimeoutSec 90 -QuietMs 2000
     }
 
-    # CIMC contacts the HTTP server before it returns to '#'. That can take
-    # longer than a normal command when the path is slow or firewalled.
-    if ($resp -notmatch $script:RxCli) {
-        Write-Log 'Waiting for CIMC to finish contacting the HTTP share...'
-        try {
-            $resp = Read-Until -Port $Port -Patterns @($script:RxCli) -TimeoutSec 90
-        }
-        catch {
-            throw "CIMC did not return to a prompt after map-www. It may be unable to reach $BaseUrl from the CIMC management IP. Allow Python through Windows Firewall on the laptop Ethernet NIC that faces the CIMC."
-        }
+    if ((Get-CimcPromptKind -Text $resp) -ne 'cli') {
+        throw "CIMC did not return to a prompt after map-www. It may be unable to reach $BaseUrl from the CIMC management IP. Allow Python through Windows Firewall on the laptop Ethernet NIC that faces the CIMC."
     }
 
-    Start-Sleep -Seconds 2
-    $status = Send-Command -Port $Port -Command 'show mappings detail' `
-        -ExpectPatterns @($script:RxCli) -TimeoutSec 45 -InterDelayMs $delayMs
+    Write-Log -Level TX -Message '-> show mappings detail'
+    $Port.WriteLine('show mappings detail')
+    Start-Sleep -Milliseconds $delayMs
+    $status = Read-CimcSettle -Port $Port -TimeoutSec 60 -QuietMs 1500
 
     if ($status -match '(?i)Map-Status\s*:\s*OK' -or $status -match "(?i)$([regex]::Escape($Volume))\s+OK") {
         Write-Log "vMedia mapping '$Volume' reported Map-Status OK."
