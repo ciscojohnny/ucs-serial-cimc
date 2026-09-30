@@ -378,13 +378,16 @@ function Read-Until {
 function Send-Command {
     param(
         [Parameter(Mandatory)][System.IO.Ports.SerialPort]$Port,
-        [Parameter(Mandatory)][string]$Command,
+        # AllowEmptyString: map-www prompts for a username/password even on an
+        # open HTTP share. A blank Enter is the correct answer, and Windows
+        # PowerShell rejects a Mandatory string that is empty.
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Command,
         [string[]]$ExpectPatterns = @('#\s*$'),
         [int]$TimeoutSec,
         [int]$InterDelayMs,
         [switch]$Sensitive
     )
-    $display = if ($Sensitive) { '<redacted>' } else { $Command }
+    $display = if ($Sensitive) { '<redacted>' } elseif ([string]::IsNullOrEmpty($Command)) { '<blank>' } else { $Command }
     Write-Log -Level TX -Message "-> $display"
     $Port.WriteLine($Command)
     Start-Sleep -Milliseconds $InterDelayMs
