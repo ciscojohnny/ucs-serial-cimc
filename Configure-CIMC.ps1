@@ -447,55 +447,6 @@ function Send-CimcConfirm {
     return $resp
 }
 
-function Send-CimcSettled {
-    <#
-        Send a command and wait until the console has been quiet at a real
-        prompt. The first '#' CIMC prints is often the old prompt, reprinted
-        before the command's result. Returning on that '#' sends the next
-        command too early; commit is then echoed and no new prompt ever arrives.
-        If the result stays silent, Enter redraws the prompt.
-    #>
-    param(
-        [Parameter(Mandatory)][System.IO.Ports.SerialPort]$Port,
-        [Parameter(Mandatory)][AllowEmptyString()][string]$Command,
-        [int]$TimeoutSec = 20,
-        [int]$InterDelayMs = 250,
-        [int]$QuietMs = 1500
-    )
-    $display = if ([string]::IsNullOrEmpty($Command)) { '<blank>' } else { $Command }
-    Write-Log -Level TX -Message "-> $display"
-    if ([string]::IsNullOrEmpty($Command)) { $Port.Write("`r") } else { $Port.WriteLine($Command) }
-    Start-Sleep -Milliseconds $InterDelayMs
-
-    $deadline = [datetime]::UtcNow.AddSeconds($TimeoutSec)
-    $nudges = 0
-    while ([datetime]::UtcNow -lt $deadline) {
-        $remaining = [int][Math]::Ceiling(($deadline - [datetime]::UtcNow).TotalSeconds)
-        if ($remaining -lt 1) { $remaining = 1 }
-        try {
-            $resp = Read-CimcSettle -Port $Port -TimeoutSec ([Math]::Min(6, $remaining)) -QuietMs $QuietMs -PromptQuietMs 400
-        } catch {
-            $nudges++
-            if ($nudges -gt 2 -or [datetime]::UtcNow -ge $deadline) { throw }
-            Write-Log "No prompt yet after '$display'. Sending Enter so CIMC redraws it."
-            $Port.Write("`r")
-            Start-Sleep -Milliseconds $InterDelayMs
-            continue
-        }
-        Write-CimcTail -Text $resp
-        $kind = Get-CimcPromptKind -Text $resp
-        if ($kind -eq 'confirm' -or $kind -eq 'save') {
-            Write-Log 'Auto-confirming CIMC prompt with "y".'
-            Write-Log -Level TX -Message '-> y'
-            $Port.WriteLine('y')
-            Start-Sleep -Milliseconds $InterDelayMs
-            continue
-        }
-        if ($kind -eq 'cli') { return $resp }
-    }
-    throw "Timeout waiting for a CIMC prompt after '$display'."
-}
-
 function Sync-CimcPrompt {
     <#
         Get the reader back in step with the console. Discards buffered text and
@@ -1460,17 +1411,6 @@ function Set-CimcVmediaMap {
 
     Send-Command -Port $Port -Command 'top' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
     Send-Command -Port $Port -Command 'scope vmedia' -ExpectPatterns @('#\s*$','Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-
-    # IMC 6.0 leaves virtual media disabled. map-www will store the volume, but
-    # the CIMC does not open the URL until this service is enabled.
-    # Send-Command returns on the first '#'. This CLI reprints that prompt and
-    # only then prints the real result, so the next command (commit) was typed
-    # before the previous one finished. Over SSH the same commit returns in a
-    # few seconds. Wait until the line has been quiet, and press Enter if the
-    # prompt needs to be drawn again.
-    Write-Log 'Enabling virtual media before map-www.'
-    Send-CimcSettled -Port $Port -Command 'set enabled yes' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-    Send-CimcSettled -Port $Port -Command 'commit' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
 
     # Remove any pre-existing volume with the same name so re-runs are clean.
     # CIMC does not use the usual [y/N] prompt here. It asks:
