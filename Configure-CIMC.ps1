@@ -1273,10 +1273,16 @@ function Set-CimcVmediaMap {
             $Port.WriteLine([string]$Pass)
         }
         elseif ($kind -eq 'username') {
-            Write-Log 'map-www username prompt; sending configured username or a blank Enter.'
-            $shown = if ([string]::IsNullOrEmpty($User)) { '<blank>' } else { $User }
-            Write-Log -Level TX -Message "-> $shown"
-            $Port.WriteLine([string]$User)
+            # A blank Enter at "Server username:" returns to the prompt and does
+            # not create the mapping. Python ignores the name; CIMC still wants one.
+            $sendUser = if ([string]::IsNullOrEmpty($User)) { 'anonymous' } else { $User }
+            if ([string]::IsNullOrEmpty($User)) {
+                Write-Log 'map-www username prompt; sending "anonymous" (a blank Enter cancels the mapping on this CIMC).'
+            } else {
+                Write-Log 'map-www username prompt; sending configured username.'
+            }
+            Write-Log -Level TX -Message "-> $sendUser"
+            $Port.WriteLine($sendUser)
         }
         elseif ($kind -eq 'cli') {
             Write-Log 'map-www returned to the CLI prompt.'
@@ -1293,10 +1299,14 @@ function Set-CimcVmediaMap {
         throw "CIMC did not return to a prompt after map-www. It may be unable to reach $BaseUrl from the CIMC management IP. Allow Python through Windows Firewall on the laptop Ethernet NIC that faces the CIMC."
     }
 
-    Write-Log -Level TX -Message '-> show mappings detail'
-    $Port.WriteLine('show mappings detail')
-    Start-Sleep -Milliseconds $delayMs
-    $status = Read-CimcSettle -Port $Port -TimeoutSec 60 -QuietMs 1500
+    try {
+        $status = Send-Command -Port $Port -Command 'show mappings detail' `
+            -ExpectPatterns @($script:RxCli) -TimeoutSec 45 -InterDelayMs $delayMs
+        Write-CimcTail -Text $status
+    }
+    catch {
+        throw "map-www returned to the prompt, but 'show mappings detail' produced no output. The CIMC is likely stuck contacting $BaseUrl. The laptop address must be on the CIMC subnet, and Windows Firewall must allow inbound TCP to that port."
+    }
 
     if ($status -match '(?i)Map-Status\s*:\s*OK' -or $status -match "(?i)$([regex]::Escape($Volume))\s+OK") {
         Write-Log "vMedia mapping '$Volume' reported Map-Status OK."
@@ -1403,6 +1413,12 @@ function Invoke-FirmwareUpgrade {
             }
             $serveHost = Get-ServeHostAddress -Override ([string]$fw.serveHost) -TargetIp $TargetIp -SubnetMask ([string]$Config.site.subnetMask)
             if (-not $serveHost) { throw 'Could not determine a local IP to serve the ISO from. Set firmware.serveHost explicitly.' }
+            $mask = [string]$Config.site.subnetMask
+            $explicitHost = -not [string]::IsNullOrWhiteSpace([string]$fw.serveHost)
+            if ($TargetIp -and $mask -and -not (Test-IpInSubnet -A $serveHost -B $TargetIp -Mask $mask)) {
+                $msg = "Laptop address $serveHost is not on the CIMC subnet ($TargetIp / $mask). The CIMC cannot mount an ISO from that address. Assign the laptop Ethernet NIC a static IP in the CIMC subnet, or set firmware.serveHost to that IP."
+                if ($explicitHost) { Write-Log -Level WARN $msg } else { throw $msg }
+            }
             $server  = Start-IsoHttpServer -Folder $isoFolder -ListenPort $listenPort
             # No trailing slash. CIMC inserts one when it joins the share and the
             # filename, so a share of "http://host:8000/" becomes "http://host:8000//file".
