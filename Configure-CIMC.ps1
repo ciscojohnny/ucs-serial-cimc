@@ -447,6 +447,55 @@ function Send-CimcConfirm {
     return $resp
 }
 
+function Send-CimcSettled {
+    <#
+        Send a command and wait until the console has been quiet at a real
+        prompt. The first '#' CIMC prints is often the old prompt, reprinted
+        before the command's result. Returning on that '#' sends the next
+        command too early; commit is then echoed and no new prompt ever arrives.
+        If the result stays silent, Enter redraws the prompt.
+    #>
+    param(
+        [Parameter(Mandatory)][System.IO.Ports.SerialPort]$Port,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Command,
+        [int]$TimeoutSec = 20,
+        [int]$InterDelayMs = 250,
+        [int]$QuietMs = 1500
+    )
+    $display = if ([string]::IsNullOrEmpty($Command)) { '<blank>' } else { $Command }
+    Write-Log -Level TX -Message "-> $display"
+    if ([string]::IsNullOrEmpty($Command)) { $Port.Write("`r") } else { $Port.WriteLine($Command) }
+    Start-Sleep -Milliseconds $InterDelayMs
+
+    $deadline = [datetime]::UtcNow.AddSeconds($TimeoutSec)
+    $nudges = 0
+    while ([datetime]::UtcNow -lt $deadline) {
+        $remaining = [int][Math]::Ceiling(($deadline - [datetime]::UtcNow).TotalSeconds)
+        if ($remaining -lt 1) { $remaining = 1 }
+        try {
+            $resp = Read-CimcSettle -Port $Port -TimeoutSec ([Math]::Min(6, $remaining)) -QuietMs $QuietMs -PromptQuietMs 400
+        } catch {
+            $nudges++
+            if ($nudges -gt 2 -or [datetime]::UtcNow -ge $deadline) { throw }
+            Write-Log "No prompt yet after '$display'. Sending Enter so CIMC redraws it."
+            $Port.Write("`r")
+            Start-Sleep -Milliseconds $InterDelayMs
+            continue
+        }
+        Write-CimcTail -Text $resp
+        $kind = Get-CimcPromptKind -Text $resp
+        if ($kind -eq 'confirm' -or $kind -eq 'save') {
+            Write-Log 'Auto-confirming CIMC prompt with "y".'
+            Write-Log -Level TX -Message '-> y'
+            $Port.WriteLine('y')
+            Start-Sleep -Milliseconds $InterDelayMs
+            continue
+        }
+        if ($kind -eq 'cli') { return $resp }
+    }
+    throw "Timeout waiting for a CIMC prompt after '$display'."
+}
+
 function Sync-CimcPrompt {
     <#
         Get the reader back in step with the console. Discards buffered text and
@@ -1328,6 +1377,13 @@ function Get-CimcPromptKind {
     $userAt = if ($user.Count -gt 0) { $user[$user.Count - 1].Index } else { -1 }
     if ($passAt -ge 0 -and $passAt -ge $userAt) { return 'password' }
     if ($userAt -ge 0) { return 'username' }
+    # A reprinted "hostname #" is often followed by "[y/N]". The question has
+    # to win, or the next command is typed in as the answer.
+    $confirm = [regex]::Matches($flat, $script:RxConfirm)
+    $hashes = [regex]::Matches($flat, '#')
+    $confirmAt = if ($confirm.Count -gt 0) { $confirm[$confirm.Count - 1].Index } else { -1 }
+    $hashAt = if ($hashes.Count -gt 0) { $hashes[$hashes.Count - 1].Index } else { -1 }
+    if ($confirmAt -ge 0 -and $confirmAt -gt $hashAt) { return 'confirm' }
     if ($flat -match '#\s*$') { return 'cli' }
     return ''
 }
@@ -1377,7 +1433,7 @@ function Read-CimcSettle {
         if (-not $saw) { continue }
         $kind = Get-CimcPromptKind -Text $buffer.ToString()
         $quiet = $lastRx.ElapsedMilliseconds
-        if (($kind -eq 'username' -or $kind -eq 'password' -or $kind -eq 'save') -and $quiet -ge $PromptQuietMs) {
+        if (($kind -eq 'username' -or $kind -eq 'password' -or $kind -eq 'save' -or $kind -eq 'confirm') -and $quiet -ge $PromptQuietMs) {
             return $buffer.ToString()
         }
         if ($kind -eq 'cli' -and $quiet -ge $QuietMs) { return $buffer.ToString() }
@@ -1406,18 +1462,19 @@ function Set-CimcVmediaMap {
     Send-Command -Port $Port -Command 'scope vmedia' -ExpectPatterns @('#\s*$','Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
 
     # IMC 6.0 leaves virtual media disabled. map-www will store the volume, but
-    # the CIMC does not open the URL until this service is enabled. The commit
-    # echoes and then stays silent while the virtual-media service starts;
-    # the normal 20s command timeout expires before the prompt comes back.
-    Write-Log 'Enabling virtual media before map-www. The commit can stay quiet for up to a minute.'
-    Send-CimcConfirm -Port $Port -Command 'set enabled yes' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-    $lowPower = Send-Command -Port $Port -Command 'set low-power-usb-enabled no' `
-        -ExpectPatterns @($script:RxCli, '(?i)invalid', '(?i)error') `
-        -TimeoutSec $cmdTO -InterDelayMs $delayMs
+    # the CIMC does not open the URL until this service is enabled.
+    # Send-Command returns on the first '#'. This CLI reprints that prompt and
+    # only then prints the real result, so the next command (commit) was typed
+    # before the previous one finished. Over SSH the same commit returns in a
+    # few seconds. Wait until the line has been quiet, and press Enter if the
+    # prompt needs to be drawn again.
+    Write-Log 'Enabling virtual media before map-www.'
+    Send-CimcSettled -Port $Port -Command 'set enabled yes' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+    $lowPower = Send-CimcSettled -Port $Port -Command 'set low-power-usb-enabled no' -TimeoutSec $cmdTO -InterDelayMs $delayMs
     if ($lowPower -match '(?i)invalid') {
         Write-Log -Level WARN "This CIMC did not accept 'set low-power-usb-enabled no'. Continuing."
     }
-    Send-CimcConfirm -Port $Port -Command 'commit' -TimeoutSec 90 -InterDelayMs $delayMs | Out-Null
+    Send-CimcSettled -Port $Port -Command 'commit' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
 
     # Remove any pre-existing volume with the same name so re-runs are clean.
     # CIMC does not use the usual [y/N] prompt here. It asks:
@@ -1467,6 +1524,11 @@ function Set-CimcVmediaMap {
                 Write-Log -Level TX -Message "-> $sendUser"
             }
             $Port.WriteLine($sendUser)
+        }
+        elseif ($kind -eq 'confirm') {
+            Write-Log 'map-www confirmation prompt; sending "y".'
+            Write-Log -Level TX -Message '-> y'
+            $Port.WriteLine('y')
         }
         elseif ($kind -eq 'cli') {
             Write-Log 'map-www returned to the CLI prompt.'
