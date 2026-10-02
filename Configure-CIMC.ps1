@@ -1022,6 +1022,18 @@ function Get-LocalIPv4Addresses {
     return $list
 }
 
+function Get-IPv4InterfaceName {
+    param([Parameter(Mandatory)][string]$Address)
+    try {
+        foreach ($ni in [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()) {
+            foreach ($ua in $ni.GetIPProperties().UnicastAddresses) {
+                if ($ua.Address.ToString() -eq $Address) { return $ni.Name }
+            }
+        }
+    } catch {}
+    return $null
+}
+
 function Test-IpInSubnet {
     # True if $A and $B are in the same IPv4 subnet under $Mask.
     param([string]$A, [string]$B, [string]$Mask)
@@ -1093,27 +1105,122 @@ function Resolve-PythonCommand {
     throw "Python 3 is required to serve the ISO locally. Install it from https://www.python.org/downloads/ or set firmware.transport to 'url' and provide firmware.shareUrl."
 }
 
+function Add-IsoHttpFirewallRule {
+    # Best-effort. A non-admin shell cannot change the firewall; the mount can
+    # still succeed if the operator already allowed the port.
+    param([Parameter(Mandatory)][int]$ListenPort)
+    $onWindows = ($env:OS -eq 'Windows_NT')
+    if (-not $onWindows) { return }
+    $name = "UCS CIMC ISO HTTP $ListenPort"
+    & netsh advfirewall firewall delete rule name="$name" | Out-Null
+    $out = & netsh advfirewall firewall add rule name="$name" dir=in action=allow protocol=TCP localport=$ListenPort profile=any 2>&1 | Out-String
+    if ($LASTEXITCODE -eq 0) {
+        Write-Log "Windows Firewall allows inbound TCP $ListenPort."
+    } else {
+        Write-Log -Level WARN "Could not add a Windows Firewall allow rule for TCP ${ListenPort}: $($out.Trim()). If this log never shows an HTTP line from the CIMC, inbound TCP on the Ethernet adapter is still blocked."
+    }
+}
+
+function Test-IsoHttpFile {
+    # Read one byte. A full GET would download a multi-gigabyte HUU ISO.
+    param([Parameter(Mandatory)][string]$Url)
+    $req = [System.Net.HttpWebRequest]::Create($Url)
+    $req.Method = 'GET'
+    # A corporate proxy on Wi-Fi would send this check off-box and hide a
+    # listener that is fine on the Ethernet NIC facing the CIMC.
+    $req.Proxy = New-Object System.Net.WebProxy
+    $req.Timeout = 15000
+    $req.ReadWriteTimeout = 15000
+    $req.AddRange(0, 15)
+    $req.AllowAutoRedirect = $false
+    try {
+        $resp = $req.GetResponse()
+        try {
+            $code = [int]$resp.StatusCode
+            Write-Log "Local check of $Url returned HTTP $code."
+            if ($code -ne 200 -and $code -ne 206) {
+                throw "Laptop could not read the ISO at $Url (HTTP $code)."
+            }
+        } finally {
+            $resp.Close()
+        }
+    } catch [System.Net.WebException] {
+        $failed = $_.Exception.Response
+        if ($failed) {
+            $code = [int]$failed.StatusCode
+            $failed.Close()
+            throw "Laptop could not read the ISO at $Url (HTTP $code). The CIMC would fail the same request."
+        }
+        throw "Laptop could not connect to $Url. $($_.Exception.Message)"
+    }
+}
+
 function Start-IsoHttpServer {
-    # Serve $Folder over HTTP on $ListenPort using Python's built-in server.
+    # Serve $Folder over HTTP on $BindAddress:$ListenPort.
     # The parameter is NOT named Port: PowerShell variable names are
     # case-insensitive, so $Port would collide with the serial-port object and
     # the HTTP listener would be handed a SerialPort instead of an integer.
     # Returns the running Process object (kept alive until the upgrade finishes).
     param(
         [Parameter(Mandatory)][string]$Folder,
-        [Parameter(Mandatory)][int]$ListenPort
+        [Parameter(Mandatory)][int]$ListenPort,
+        [Parameter(Mandatory)][string]$BindAddress
     )
     if (-not (Test-Path -LiteralPath $Folder)) {
         throw "Firmware folder not found: '$Folder'."
     }
     $python = Resolve-PythonCommand
     $full = (Resolve-Path -LiteralPath $Folder).Path
+    # CIMC joins the share and the filename with its own slash, so the request
+    # path is sometimes "//file.iso". Python on Windows treats a path that
+    # still starts with "//" as a UNC path and returns 404. Collapse the extra
+    # slash before mapping the URL onto the folder.
+    $helper = Join-Path ([System.IO.Path]::GetTempPath()) ("cimc-iso-http-{0}.py" -f $PID)
+    $script:IsoHelperPath = $helper
+    Set-Content -LiteralPath $helper -Encoding ASCII -Value @'
+import os
+import sys
+import posixpath
+import urllib.parse
+try:
+    from http.server import ThreadingHTTPServer as HttpServer, SimpleHTTPRequestHandler
+except ImportError:
+    from socketserver import ThreadingMixIn
+    from http.server import HTTPServer, SimpleHTTPRequestHandler
+    class HttpServer(ThreadingMixIn, HTTPServer):
+        daemon_threads = True
+
+class IsoHandler(SimpleHTTPRequestHandler):
+    def translate_path(self, path):
+        path = urllib.parse.urlsplit(path).path
+        path = urllib.parse.unquote(path)
+        path = posixpath.normpath(path)
+        while "//" in path:
+            path = path.replace("//", "/")
+        words = [w for w in path.split("/") if w not in ("", ".", "..")]
+        out = os.getcwd()
+        for word in words:
+            out = os.path.join(out, word)
+        return out
+
+    def log_message(self, fmt, *args):
+        sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
+        sys.stderr.flush()
+
+bind = sys.argv[1]
+port = int(sys.argv[2])
+os.chdir(sys.argv[3])
+server = HttpServer((bind, port), IsoHandler)
+sys.stderr.write("listening on %s:%s\n" % (bind, port))
+sys.stderr.flush()
+server.serve_forever()
+'@
     $pyArgs = if ([System.IO.Path]::GetFileName($python.Source) -ieq 'py.exe') {
-        "-3 -m http.server $ListenPort --bind 0.0.0.0"
+        "-3 `"$helper`" $BindAddress $ListenPort `"$full`""
     } else {
-        "-m http.server $ListenPort --bind 0.0.0.0"
+        "`"$helper`" $BindAddress $ListenPort `"$full`""
     }
-    Write-Log "Starting local HTTP server: folder='$full' port=$ListenPort (python: $($python.Source))"
+    Write-Log "Starting local HTTP server: folder='$full' bind=${BindAddress}:${ListenPort} (python: $($python.Source))"
     $psi = [System.Diagnostics.ProcessStartInfo]::new()
     $psi.FileName               = $python.Source
     $psi.Arguments              = $pyArgs
@@ -1122,27 +1229,50 @@ function Start-IsoHttpServer {
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError  = $true
     $proc = [System.Diagnostics.Process]::Start($psi)
+    $logPath = $script:SessionLog
+    foreach ($evt in @('OutputDataReceived','ErrorDataReceived')) {
+        Register-ObjectEvent -InputObject $proc -EventName $evt -MessageData $logPath `
+            -SourceIdentifier ("CimcHttp{0}{1}" -f $evt, $proc.Id) -Action {
+                $text = $EventArgs.Data
+                if (-not $text) { return }
+                $line = '{0} [INFO] HTTP: {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'), $text
+                Add-Content -LiteralPath $Event.MessageData -Value $line
+                Write-Host $line
+            } | Out-Null
+    }
+    try { $proc.BeginOutputReadLine() } catch {}
+    try { $proc.BeginErrorReadLine() } catch {}
     Start-Sleep -Seconds 1
     if ($proc.HasExited) {
         $detail = ''
         try { $detail = (($proc.StandardError.ReadToEnd() + ' ' + $proc.StandardOutput.ReadToEnd()).Trim()) } catch {}
+        Get-EventSubscriber -ErrorAction SilentlyContinue |
+            Where-Object { $_.SourceIdentifier -like ("CimcHttp*{0}" -f $proc.Id) } |
+            ForEach-Object { Unregister-Event -SubscriptionId $_.SubscriptionId -ErrorAction SilentlyContinue }
         if (-not $detail) {
-            $detail = "Check that Python 3 is really installed (not the Windows Store alias) and that TCP port $ListenPort is free."
+            $detail = "Check that Python 3 is really installed (not the Windows Store alias), that $BindAddress is an address on this laptop, and that TCP port $ListenPort is free."
         }
+        Stop-IsoHttpServer -Proc $proc
         throw "Local HTTP server exited immediately (exit code $($proc.ExitCode)). $detail"
     }
-    # Drain the pipes so a long ISO download cannot fill them and stall Python.
-    try { $proc.BeginOutputReadLine() } catch {}
-    try { $proc.BeginErrorReadLine() } catch {}
     return $proc
 }
 
 function Stop-IsoHttpServer {
     param([System.Diagnostics.Process]$Proc)
+    if ($Proc) {
+        Get-EventSubscriber -ErrorAction SilentlyContinue |
+            Where-Object { $_.SourceIdentifier -like ("CimcHttp*{0}" -f $Proc.Id) } |
+            ForEach-Object { Unregister-Event -SubscriptionId $_.SubscriptionId -ErrorAction SilentlyContinue }
+    }
     if ($Proc -and -not $Proc.HasExited) {
         try { $Proc.Kill() } catch {}
         try { $Proc.WaitForExit(3000) | Out-Null } catch {}
         Write-Log 'Local HTTP server stopped.'
+    }
+    if ($script:IsoHelperPath -and (Test-Path -LiteralPath $script:IsoHelperPath)) {
+        Remove-Item -LiteralPath $script:IsoHelperPath -Force -ErrorAction SilentlyContinue
+        $script:IsoHelperPath = $null
     }
 }
 
@@ -1300,18 +1430,22 @@ function Set-CimcVmediaMap {
     }
 
     try {
+        # This command probes the share. CIMC's HTTP client often takes longer
+        # than 45s to give up, and aborting here used to kill Python mid-mount.
         $status = Send-Command -Port $Port -Command 'show mappings detail' `
-            -ExpectPatterns @($script:RxCli) -TimeoutSec 45 -InterDelayMs $delayMs
+            -ExpectPatterns @($script:RxCli) -TimeoutSec 120 -InterDelayMs $delayMs
         Write-CimcTail -Text $status
     }
     catch {
-        throw "map-www returned to the prompt, but 'show mappings detail' produced no output. The CIMC is likely stuck contacting $BaseUrl. The laptop address must be on the CIMC subnet, and Windows Firewall must allow inbound TCP to that port."
+        $why = $_.Exception.Message
+        Write-Log -Level WARN $why
+        throw "map-www returned to the prompt, but 'show mappings detail' did not finish. CIMC is stuck opening ${BaseUrl}${IsoFile}. $why An 'HTTP:' line from the CIMC address in this log means the laptop saw the request. If the only HTTP line is from this laptop, the CIMC never connected."
     }
 
     if ($status -match '(?i)Map-Status\s*:\s*OK' -or $status -match "(?i)$([regex]::Escape($Volume))\s+OK") {
         Write-Log "vMedia mapping '$Volume' reported Map-Status OK."
     } else {
-        Write-Log -Level WARN "vMedia mapping '$Volume' did not report OK. Check reachability from the CIMC to $BaseUrl (firewall / laptop on the mgmt network?). show mappings output was logged."
+        throw "vMedia volume '$Volume' is not Map-Status OK, so the server will not be power-cycled. CIMC did not mount ${BaseUrl}${IsoFile}. An 'HTTP:' line from the CIMC address means the laptop received the request; no such line means the CIMC never connected."
     }
     return $status
 }
@@ -1417,18 +1551,32 @@ function Invoke-FirmwareUpgrade {
             if ($TargetIp -and $mask -and -not (Test-IpInSubnet -A $serveHost -B $TargetIp -Mask $mask)) {
                 throw "Laptop address $serveHost is not on the CIMC subnet ($TargetIp / $mask). The CIMC cannot mount an ISO from that address. Clear firmware.serveHost so the script can choose the Ethernet NIC on the CIMC subnet, or set serveHost to that Ethernet IP. Reaching the CIMC web page from the laptop does not mean the CIMC can connect back to this address."
             }
-            $server  = Start-IsoHttpServer -Folder $isoFolder -ListenPort $listenPort
-            # No trailing slash. CIMC inserts one when it joins the share and the
-            # filename, so a share of "http://host:8000/" becomes "http://host:8000//file".
-            # Python on Windows treats a leading "//" as a UNC path and the mount fails.
-            $baseUrl = "http://${serveHost}:${listenPort}"
-            Write-Log "Serving ISO to CIMC at ${baseUrl}/${isoFile} (the CIMC's IP must be able to reach ${serveHost}:${listenPort})."
+            $ifName = Get-IPv4InterfaceName -Address $serveHost
+            if ($ifName) {
+                Write-Log "ISO will be served from $serveHost on interface '$ifName'."
+                if ($ifName -match '(?i)wi-?fi|wireless|wlan') {
+                    Write-Log -Level WARN "That address is on '$ifName'. The CIMC can only mount the ISO from the NIC cabled to the CIMC management port. Put a static IP on that Ethernet adapter and leave firmware.serveHost empty, or set serveHost to the Ethernet IP."
+                }
+            }
+            Add-IsoHttpFirewallRule -ListenPort $listenPort
+            $server  = Start-IsoHttpServer -Folder $isoFolder -ListenPort $listenPort -BindAddress $serveHost
+            # Cisco's map-www examples keep the trailing slash on the share
+            # (map-www vol http://host/ file.iso). Omitting it makes this CIMC
+            # request http://host:8000filename.iso, which never connects, and
+            # 'show mappings detail' then blocks until that attempt times out.
+            $baseUrl = "http://${serveHost}:${listenPort}/"
+            Write-Log "Serving ISO to CIMC at ${baseUrl}${isoFile} (the CIMC's IP must be able to reach ${serveHost}:${listenPort})."
+            Test-IsoHttpFile -Url "${baseUrl}${isoFile}"
+            Test-IsoHttpFile -Url ("http://{0}:{1}//{2}" -f $serveHost, $listenPort, $isoFile)
+            Start-Sleep -Milliseconds 500
+            Write-Log "HTTP lines above are this laptop checking the ISO. A later HTTP line from the CIMC address means the mount reached the laptop."
             Set-CimcVmediaMap -Port $SerialPort -Config $Config -Volume $volume -BaseUrl $baseUrl -IsoFile $isoFile `
                 -User ([string]$fw.shareUser) -Pass ([string]$fw.sharePassword) | Out-Null
         }
         elseif ($transport -ieq 'url') {
-            $baseUrl = ([string]$fw.shareUrl).TrimEnd('/')
+            $baseUrl = ([string]$fw.shareUrl).Trim().TrimEnd('/')
             if (-not $baseUrl) { throw 'firmware.transport is "url" but firmware.shareUrl is not set.' }
+            $baseUrl = "${baseUrl}/"
             Set-CimcVmediaMap -Port $SerialPort -Config $Config -Volume $volume -BaseUrl $baseUrl -IsoFile $isoFile `
                 -User ([string]$fw.shareUser) -Pass ([string]$fw.sharePassword) | Out-Null
         }
