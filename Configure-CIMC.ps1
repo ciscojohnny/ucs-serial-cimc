@@ -1470,10 +1470,6 @@ function Set-CimcVmediaMap {
     # prompt needs to be drawn again.
     Write-Log 'Enabling virtual media before map-www.'
     Send-CimcSettled -Port $Port -Command 'set enabled yes' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-    $lowPower = Send-CimcSettled -Port $Port -Command 'set low-power-usb-enabled no' -TimeoutSec $cmdTO -InterDelayMs $delayMs
-    if ($lowPower -match '(?i)invalid') {
-        Write-Log -Level WARN "This CIMC did not accept 'set low-power-usb-enabled no'. Continuing."
-    }
     Send-CimcSettled -Port $Port -Command 'commit' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
 
     # Remove any pre-existing volume with the same name so re-runs are clean.
