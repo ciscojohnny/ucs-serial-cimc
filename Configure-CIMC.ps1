@@ -1434,10 +1434,10 @@ function Set-CimcVmediaMap {
     $resp = Read-CimcSettle -Port $Port -TimeoutSec $cmdTO -QuietMs 8000
     Write-CimcTail -Text $resp
 
-    # Python's HTTP server has no login. This CIMC asks "Server username:" and,
-    # after a blank Enter, returns straight to "/vmedia #" with no password
-    # question. Other builds ask for both. Answer whichever prompts appear, and
-    # stop when the CLI prompt is back and no credential question is in the text.
+    # Python's HTTP server has no login. Leave the username and password blank
+    # unless firmware.shareUser / firmware.sharePassword are set. A manual
+    # mapping on this CIMC accepts those empty fields. Answer whichever prompts
+    # appear, and stop when the CLI prompt is back.
     $guard = 6
     while ($guard-- -gt 0) {
         $kind = Get-CimcPromptKind -Text $resp
@@ -1448,15 +1448,14 @@ function Set-CimcVmediaMap {
             $Port.WriteLine([string]$Pass)
         }
         elseif ($kind -eq 'username') {
-            # A blank Enter at "Server username:" returns to the prompt and does
-            # not create the mapping. Python ignores the name; CIMC still wants one.
-            $sendUser = if ([string]::IsNullOrEmpty($User)) { 'anonymous' } else { $User }
-            if ([string]::IsNullOrEmpty($User)) {
-                Write-Log 'map-www username prompt; sending "anonymous" (a blank Enter cancels the mapping on this CIMC).'
+            $sendUser = [string]$User
+            if ([string]::IsNullOrEmpty($sendUser)) {
+                Write-Log 'map-www username prompt; leaving it blank.'
+                Write-Log -Level TX -Message '-> <blank>'
             } else {
                 Write-Log 'map-www username prompt; sending configured username.'
+                Write-Log -Level TX -Message "-> $sendUser"
             }
-            Write-Log -Level TX -Message "-> $sendUser"
             $Port.WriteLine($sendUser)
         }
         elseif ($kind -eq 'cli') {
