@@ -1414,10 +1414,8 @@ function Invoke-FirmwareUpgrade {
             $serveHost = Get-ServeHostAddress -Override ([string]$fw.serveHost) -TargetIp $TargetIp -SubnetMask ([string]$Config.site.subnetMask)
             if (-not $serveHost) { throw 'Could not determine a local IP to serve the ISO from. Set firmware.serveHost explicitly.' }
             $mask = [string]$Config.site.subnetMask
-            $explicitHost = -not [string]::IsNullOrWhiteSpace([string]$fw.serveHost)
             if ($TargetIp -and $mask -and -not (Test-IpInSubnet -A $serveHost -B $TargetIp -Mask $mask)) {
-                $msg = "Laptop address $serveHost is not on the CIMC subnet ($TargetIp / $mask). The CIMC cannot mount an ISO from that address. Assign the laptop Ethernet NIC a static IP in the CIMC subnet, or set firmware.serveHost to that IP."
-                if ($explicitHost) { Write-Log -Level WARN $msg } else { throw $msg }
+                throw "Laptop address $serveHost is not on the CIMC subnet ($TargetIp / $mask). The CIMC cannot mount an ISO from that address. Clear firmware.serveHost so the script can choose the Ethernet NIC on the CIMC subnet, or set serveHost to that Ethernet IP. Reaching the CIMC web page from the laptop does not mean the CIMC can connect back to this address."
             }
             $server  = Start-IsoHttpServer -Folder $isoFolder -ListenPort $listenPort
             # No trailing slash. CIMC inserts one when it joins the share and the
