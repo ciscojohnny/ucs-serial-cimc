@@ -1105,42 +1105,66 @@ function Resolve-PythonCommand {
     throw "Python 3 is required to serve the ISO locally. Install it from https://www.python.org/downloads/ or set firmware.transport to 'url' and provide firmware.shareUrl."
 }
 
+function Test-IsWindowsAdmin {
+    if ($env:OS -ne 'Windows_NT') { return $false }
+    try {
+        $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $principal = New-Object Security.Principal.WindowsPrincipal($id)
+        return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch { return $false }
+}
+
 function Add-IsoHttpFirewallRule {
-    # Best-effort. A non-admin shell cannot change the firewall; the mount can
-    # still succeed if the operator already allowed the port.
-    param([Parameter(Mandatory)][int]$ListenPort)
-    $onWindows = ($env:OS -eq 'Windows_NT')
-    if (-not $onWindows) { return }
+    # Best-effort. A non-admin shell cannot change the firewall. Connecting to
+    # the laptop's own Ethernet IP is an inbound connection, so Windows can
+    # block http://<ethernet-ip>:8000 while http://127.0.0.1:8000 still works.
+    param(
+        [Parameter(Mandatory)][int]$ListenPort,
+        [string]$Program
+    )
+    if ($env:OS -ne 'Windows_NT') { return }
     $name = "UCS CIMC ISO HTTP $ListenPort"
     & netsh advfirewall firewall delete rule name="$name" | Out-Null
-    $out = & netsh advfirewall firewall add rule name="$name" dir=in action=allow protocol=TCP localport=$ListenPort profile=any 2>&1 | Out-String
+    $out = & netsh advfirewall firewall add rule name="$name" dir=in action=allow protocol=TCP localport=$ListenPort profile=any enable=yes 2>&1 | Out-String
+    if ($Program) {
+        $progName = "$name python"
+        & netsh advfirewall firewall delete rule name="$progName" | Out-Null
+        $progOut = & netsh advfirewall firewall add rule name="$progName" dir=in action=allow program="$Program" protocol=TCP localport=$ListenPort profile=any enable=yes 2>&1 | Out-String
+        $out = ($out + ' ' + $progOut).Trim()
+    }
     if ($LASTEXITCODE -eq 0) {
         Write-Log "Windows Firewall allows inbound TCP $ListenPort."
     } else {
-        Write-Log -Level WARN "Could not add a Windows Firewall allow rule for TCP ${ListenPort}: $($out.Trim()). If this log never shows an HTTP line from the CIMC, inbound TCP on the Ethernet adapter is still blocked."
+        $who = if (Test-IsWindowsAdmin) { 'The firewall command failed.' } else { 'This window is not running as Administrator.' }
+        Write-Log -Level WARN "Could not add a Windows Firewall allow rule for TCP ${ListenPort}. $who $out"
     }
 }
 
-function Test-IsoHttpFile {
-    # Read one byte. A full GET would download a multi-gigabyte HUU ISO.
-    param([Parameter(Mandatory)][string]$Url)
+function Test-IsoHttpReachable {
+    # Returns $true when the URL answers HTTP 200 or 206. A full GET of the
+    # ISO would download several gigabytes, so -Range reads one byte.
+    param(
+        [Parameter(Mandatory)][string]$Url,
+        [switch]$Range
+    )
     $req = [System.Net.HttpWebRequest]::Create($Url)
     $req.Method = 'GET'
-    # A corporate proxy on Wi-Fi would send this check off-box and hide a
-    # listener that is fine on the Ethernet NIC facing the CIMC.
-    $req.Proxy = New-Object System.Net.WebProxy
-    $req.Timeout = 15000
-    $req.ReadWriteTimeout = 15000
-    $req.AddRange(0, 15)
+    $req.Timeout = 8000
+    $req.ReadWriteTimeout = 8000
     $req.AllowAutoRedirect = $false
+    $req.KeepAlive = $false
+    # Wi-Fi often has a proxy. A browser will send http://<ethernet-ip>:8000
+    # to that proxy, which cannot reach the CIMC subnet. Bypass it here.
+    try { $req.Proxy = [System.Net.GlobalProxySelection]::GetEmptyWebProxy() } catch {
+        $req.Proxy = New-Object System.Net.WebProxy
+    }
+    if ($Range) { $req.AddRange(0, 15) }
     try {
         $resp = $req.GetResponse()
         try {
             $code = [int]$resp.StatusCode
             Write-Log "Local check of $Url returned HTTP $code."
-            if ($code -ne 200 -and $code -ne 206) {
-                throw "Laptop could not read the ISO at $Url (HTTP $code)."
-            }
+            return ($code -eq 200 -or $code -eq 206)
         } finally {
             $resp.Close()
         }
@@ -1149,9 +1173,14 @@ function Test-IsoHttpFile {
         if ($failed) {
             $code = [int]$failed.StatusCode
             $failed.Close()
-            throw "Laptop could not read the ISO at $Url (HTTP $code). The CIMC would fail the same request."
+            Write-Log -Level WARN "Local check of $Url returned HTTP $code."
+        } else {
+            Write-Log -Level WARN "Local check of $Url failed: $($_.Exception.Message)"
         }
-        throw "Laptop could not connect to $Url. $($_.Exception.Message)"
+        return $false
+    } catch {
+        Write-Log -Level WARN "Local check of $Url failed: $($_.Exception.Message)"
+        return $false
     }
 }
 
@@ -1210,6 +1239,7 @@ class IsoHandler(SimpleHTTPRequestHandler):
 bind = sys.argv[1]
 port = int(sys.argv[2])
 os.chdir(sys.argv[3])
+HttpServer.allow_reuse_address = True
 server = HttpServer((bind, port), IsoHandler)
 sys.stderr.write("listening on %s:%s\n" % (bind, port))
 sys.stderr.flush()
@@ -1558,16 +1588,46 @@ function Invoke-FirmwareUpgrade {
                     Write-Log -Level WARN "That address is on '$ifName'. The CIMC can only mount the ISO from the NIC cabled to the CIMC management port. Put a static IP on that Ethernet adapter and leave firmware.serveHost empty, or set serveHost to the Ethernet IP."
                 }
             }
-            Add-IsoHttpFirewallRule -ListenPort $listenPort
-            $server  = Start-IsoHttpServer -Folder $isoFolder -ListenPort $listenPort -BindAddress $serveHost
+            $python = Resolve-PythonCommand
+            Add-IsoHttpFirewallRule -ListenPort $listenPort -Program $python.Source
+            # 0.0.0.0 so both 127.0.0.1 and the Ethernet IP hit this process.
+            # The URL handed to CIMC is still the Ethernet address.
+            $server  = Start-IsoHttpServer -Folder $isoFolder -ListenPort $listenPort -BindAddress '0.0.0.0'
             # Cisco's map-www examples keep the trailing slash on the share
             # (map-www vol http://host/ file.iso). Omitting it makes this CIMC
             # request http://host:8000filename.iso, which never connects, and
             # 'show mappings detail' then blocks until that attempt times out.
             $baseUrl = "http://${serveHost}:${listenPort}/"
+            $loopUrl = "http://127.0.0.1:${listenPort}/"
             Write-Log "Serving ISO to CIMC at ${baseUrl}${isoFile} (the CIMC's IP must be able to reach ${serveHost}:${listenPort})."
-            Test-IsoHttpFile -Url "${baseUrl}${isoFile}"
-            Test-IsoHttpFile -Url ("http://{0}:{1}//{2}" -f $serveHost, $listenPort, $isoFile)
+            Write-Host ''
+            Write-Host "ISO server is listening on port $listenPort." -ForegroundColor Yellow
+            Write-Host "  This laptop:  $loopUrl" -ForegroundColor Yellow
+            Write-Host "  CIMC uses:    ${baseUrl}${isoFile}" -ForegroundColor Yellow
+            $loopOk = Test-IsoHttpReachable -Url $loopUrl
+            $lanOk  = Test-IsoHttpReachable -Url $baseUrl
+            if (-not $loopOk) {
+                throw "Python did not answer $loopUrl. The ISO server is not running on port $listenPort. Close anything else using that port and run the script again."
+            }
+            if (-not $lanOk) {
+                $admin = if (Test-IsWindowsAdmin) { 'The firewall allow rule still failed.' } else { 'Re-run this PowerShell window as Administrator so the script can allow inbound TCP ' + $listenPort + '.' }
+                Write-Host ''
+                Write-Host "http://127.0.0.1:${listenPort}/ answers. http://${serveHost}:${listenPort}/ does not." -ForegroundColor Red
+                Write-Host "Windows is blocking inbound connections to the Ethernet address. The CIMC uses that address, so the mount cannot work until a browser or curl on this laptop can open it." -ForegroundColor Red
+                Write-Host $admin -ForegroundColor Red
+                Write-Host "If a Windows Security prompt for Python is hiding behind this window, choose Allow. A browser on Wi-Fi may also send this address to a proxy. Test with the server still running:" -ForegroundColor Yellow
+                Write-Host "  curl.exe --noproxy `"*`" $loopUrl" -ForegroundColor Yellow
+                Write-Host "  curl.exe --noproxy `"*`" $baseUrl" -ForegroundColor Yellow
+                Write-Host 'Press Enter to stop the server...' -ForegroundColor Yellow
+                [void](Read-Host)
+                throw "This laptop cannot open http://${serveHost}:${listenPort}/ (port $listenPort). http://127.0.0.1:${listenPort}/ works, so Python is running and Windows is blocking the Ethernet address. $admin"
+            }
+            if (-not (Test-IsoHttpReachable -Url "${baseUrl}${isoFile}" -Range)) {
+                throw "The server is up at $baseUrl but the ISO URL ${baseUrl}${isoFile} did not return the file. Check firmware.isoFile and that the file is directly in the serve folder."
+            }
+            if (-not (Test-IsoHttpReachable -Url ("http://{0}:{1}//{2}" -f $serveHost, $listenPort, $isoFile) -Range)) {
+                throw "The server rejected the double-slash ISO URL CIMC sometimes requests."
+            }
             Start-Sleep -Milliseconds 500
             Write-Log "HTTP lines above are this laptop checking the ISO. A later HTTP line from the CIMC address means the mount reached the laptop."
             Set-CimcVmediaMap -Port $SerialPort -Config $Config -Volume $volume -BaseUrl $baseUrl -IsoFile $isoFile `
