@@ -1236,6 +1236,14 @@ class IsoHandler(SimpleHTTPRequestHandler):
         sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
         sys.stderr.flush()
 
+    def copyfile(self, source, outputfile):
+        # The local check closes the socket after the status line. Python then
+        # raises while sending the body. That is not a failed mount.
+        try:
+            super().copyfile(source, outputfile)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
+
 bind = sys.argv[1]
 port = int(sys.argv[2])
 os.chdir(sys.argv[3])
@@ -1398,8 +1406,10 @@ function Set-CimcVmediaMap {
     Send-Command -Port $Port -Command 'scope vmedia' -ExpectPatterns @('#\s*$','Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
 
     # IMC 6.0 leaves virtual media disabled. map-www will store the volume, but
-    # the CIMC does not open the URL until this service is enabled.
-    Write-Log 'Enabling virtual media before map-www.'
+    # the CIMC does not open the URL until this service is enabled. The commit
+    # echoes and then stays silent while the virtual-media service starts;
+    # the normal 20s command timeout expires before the prompt comes back.
+    Write-Log 'Enabling virtual media before map-www. The commit can stay quiet for up to a minute.'
     Send-CimcConfirm -Port $Port -Command 'set enabled yes' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
     $lowPower = Send-Command -Port $Port -Command 'set low-power-usb-enabled no' `
         -ExpectPatterns @($script:RxCli, '(?i)invalid', '(?i)error') `
@@ -1407,7 +1417,7 @@ function Set-CimcVmediaMap {
     if ($lowPower -match '(?i)invalid') {
         Write-Log -Level WARN "This CIMC did not accept 'set low-power-usb-enabled no'. Continuing."
     }
-    Send-CimcConfirm -Port $Port -Command 'commit' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+    Send-CimcConfirm -Port $Port -Command 'commit' -TimeoutSec 90 -InterDelayMs $delayMs | Out-Null
 
     # Remove any pre-existing volume with the same name so re-runs are clean.
     # CIMC does not use the usual [y/N] prompt here. It asks:
