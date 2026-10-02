@@ -1397,6 +1397,18 @@ function Set-CimcVmediaMap {
     Send-Command -Port $Port -Command 'top' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
     Send-Command -Port $Port -Command 'scope vmedia' -ExpectPatterns @('#\s*$','Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
 
+    # IMC 6.0 leaves virtual media disabled. map-www will store the volume, but
+    # the CIMC does not open the URL until this service is enabled.
+    Write-Log 'Enabling virtual media before map-www.'
+    Send-CimcConfirm -Port $Port -Command 'set enabled yes' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+    $lowPower = Send-Command -Port $Port -Command 'set low-power-usb-enabled no' `
+        -ExpectPatterns @($script:RxCli, '(?i)invalid', '(?i)error') `
+        -TimeoutSec $cmdTO -InterDelayMs $delayMs
+    if ($lowPower -match '(?i)invalid') {
+        Write-Log -Level WARN "This CIMC did not accept 'set low-power-usb-enabled no'. Continuing."
+    }
+    Send-CimcConfirm -Port $Port -Command 'commit' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+
     # Remove any pre-existing volume with the same name so re-runs are clean.
     # CIMC does not use the usual [y/N] prompt here. It asks:
     #   Save mapping? Enter 'yes' or 'no' to confirm (CTRL-C to cancel) -->
@@ -1411,7 +1423,10 @@ function Set-CimcVmediaMap {
             -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
     }
 
-    Write-Log "Mapping vMedia volume '$Volume' -> map-www $Volume $BaseUrl $IsoFile"
+    # The space is required. map-www takes the share and the filename as two
+    # fields (Cisco IMC 6.0: map-www volume remote-share remote-file). CIMC
+    # joins them into one URL with no space: http://host:8000/ + file.iso.
+    Write-Log "Mapping vMedia volume '$Volume'. Share '$BaseUrl' and file '$IsoFile' join as ${BaseUrl}${IsoFile}."
     $mapCmd = "map-www {0} {1} {2}" -f $Volume, $BaseUrl, $IsoFile
     Write-Log -Level TX -Message "-> $mapCmd"
     $Port.WriteLine($mapCmd)
@@ -1460,16 +1475,22 @@ function Set-CimcVmediaMap {
     }
 
     try {
-        # This command probes the share. CIMC's HTTP client often takes longer
-        # than 45s to give up, and aborting here used to kill Python mid-mount.
-        $status = Send-Command -Port $Port -Command 'show mappings detail' `
-            -ExpectPatterns @($script:RxCli) -TimeoutSec 120 -InterDelayMs $delayMs
+        # "show mappings" is the IMC 6.0 status table. "show mappings detail"
+        # on this server produced no bytes for two minutes and never opened the URL.
+        $status = Send-Command -Port $Port -Command 'show mappings' `
+            -ExpectPatterns @($script:RxCli) -TimeoutSec 45 -InterDelayMs $delayMs
         Write-CimcTail -Text $status
     }
     catch {
         $why = $_.Exception.Message
         Write-Log -Level WARN $why
-        throw "map-www returned to the prompt, but 'show mappings detail' did not finish. CIMC is stuck opening ${BaseUrl}${IsoFile}. $why An 'HTTP:' line from the CIMC address in this log means the laptop saw the request. If the only HTTP line is from this laptop, the CIMC never connected."
+        Write-Host ''
+        Write-Host "map-www was accepted, but 'show mappings' did not return. The ISO server is still running." -ForegroundColor Yellow
+        Write-Host "In CIMC, open Compute > Remote Presence > Virtual Media. The share and filename are two fields; the URL is ${BaseUrl}${IsoFile}." -ForegroundColor Yellow
+        Write-Host "An HTTP line in this window from the CIMC address means the mount reached the laptop. A line from this laptop is only the local check." -ForegroundColor Yellow
+        Write-Host 'Press Enter to stop the server...' -ForegroundColor Yellow
+        [void](Read-Host)
+        throw "map-www returned to the prompt, but 'show mappings' did not finish. CIMC did not open ${BaseUrl}${IsoFile}. $why"
     }
 
     if ($status -match '(?i)Map-Status\s*:\s*OK' -or $status -match "(?i)$([regex]::Escape($Volume))\s+OK") {
