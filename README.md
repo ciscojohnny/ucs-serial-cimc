@@ -67,7 +67,7 @@ This script talks to standalone CIMC, not UCS Manager. It is tested on a C220 M7
 | --- | --- | --- |
 | Timezone | `timezone-select`. The US list says `Central Time`. | Same command. Older menus say `Central (most areas)`. |
 | Device Connector | `scope device-connector` accepts `set enabled yes`. | `scope cloud` is the settings scope. `scope cimc / scope device-connector` only updates connector firmware, and a commit there hangs the CLI. |
-| HUU ISO address | `remoteIp` is `http://host:port`, `remoteShare` is `/file.iso`, and the job includes `bootMedium`. | The same address is retried without the 6.0-only fields, then with the bare IP and the full `http://` URL. |
+| HUU / vMedia location | One location: `remoteIp` is `http://host:port` and `remoteShare` is `/file.iso`. | Remote share and remote file stay separate. The share is `http://host:port/` and the file is the ISO name. |
 | Drives | `updateComponent` `all` skips drives. | Same token. `all,hdd` is the only value that includes drives. |
 
 An empty precision boot list is normal. The script leaves the BIOS default order in place. It does not enable UEFI secure boot, and a configuration-only run does not reboot the host.
@@ -189,7 +189,7 @@ UCS Standalone**.
 | `Timeout waiting for pattern(s): login:`                      | Baud rate / wiring / wrong physical port (use the rear console jack). After a factory reset, wait — CIMC boot can take several minutes. |
 | Script appears stuck at "Probing CIMC prompt..."              | Another app (PuTTY / SecureCRT / Tera Term / `screen`) has the serial port open, or CIMC is still booting. |
 | HUU job does not start, or the ISO never downloads           | Laptop Ethernet is not on the CIMC subnet, the firewall blocks `servePort`, the ISO name is wrong, or Python is not installed. |
-| `ISO Mapping Error`                                           | CIMC accepted the job but never opened the ISO URL. On 4.3 the script retries with the bare server IP and the full `http://` address. Confirm the CIMC IP can reach that laptop address and port. |
+| `ISO Mapping Error`                                           | CIMC accepted the 6.0 location and never opened it. On 4.3 the script retries with a separate remote share and remote file, then creates that vMedia mapping. Confirm the CIMC IP can reach the laptop address and port. |
 | `create-boot-device` / `set subtype` / `power cycle` rejected | Automatic HUU did not start, and a fallback boot token was rejected. Adjust the names in the `"firmware"` block and retry. |
 | `Authentication failed with both supplied and factory-default passwords` | Someone has changed the CIMC password and the value typed at the prompt is wrong. |
 | `Could not enter the Device Connector scope`                  | The script tried `device-connector`, `cimc/device-connector`, and `cloud`. Enable it under **Admin → Device Connector**. |

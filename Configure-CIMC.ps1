@@ -24,9 +24,10 @@
       Device Connector: settings live in scope device-connector or scope cloud.
         On 4.3, scope cimc / scope device-connector is the firmware-update
         scope. If "set enabled" is rejected, do not commit; that commit hangs.
-      HUU www map: 6.0 takes remoteIp "http://host:port", remoteShare
-        "/file.iso", plus bootMedium. On ISO Mapping Error, retry without
-        those 6.0-only fields, then with a bare IP and the full http URL.
+      HUU www map: 6.0 takes one location, remoteIp "http://host:port" and
+        remoteShare "/file.iso". 4.3 keeps remote share (http://host:port/)
+        and remote file (the ISO name) separate. ISO Mapping Error then
+        creates that vMedia mapping.
       updateComponent "all" skips drives. "all,hdd" includes them.
     Requires PowerShell 5.1+ or 7+ on Windows with access to a serial adapter.
 
@@ -1736,10 +1737,10 @@ function Set-CimcVmediaMap {
             -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
     }
 
-    # The space is required. map-www takes the share and the filename as two
-    # fields (Cisco IMC 6.0: map-www volume remote-share remote-file). CIMC
-    # joins them into one URL with no space: http://host:8000/ + file.iso.
-    Write-Log "Mapping vMedia volume '$Volume'. Share '$BaseUrl' and file '$IsoFile' join as ${BaseUrl}${IsoFile}."
+    # 4.3 asks for remote share and remote file separately. 6.0 shows one
+    # location and joins the two arguments. The share keeps its trailing slash
+    # so the join is http://host:8000/ plus the file name, not host:8000file.iso.
+    Write-Log "Mapping vMedia volume '$Volume'. Remote share '$BaseUrl', remote file '$IsoFile'."
     $mapCmd = "map-www {0} {1} {2}" -f $Volume, $BaseUrl, $IsoFile
     Write-Log -Level TX -Message "-> $mapCmd"
     $Port.WriteLine($mapCmd)
@@ -2105,13 +2106,17 @@ function Get-CimcHuuShare {
     $path = $uri.AbsolutePath
     if (-not $path.EndsWith('/')) { $path += '/' }
     $remoteShare = ($path + $IsoFile) -replace '(?<!:)/{2,}', '/'
-    # 6.0 accepts the URL in remoteIp. 4.3 validates remoteIp as a bare address
-    # and takes the full http://host:port/file URL in remoteShare.
+    $shareDir = $remoteIp
+    if (-not $shareDir.EndsWith('/')) { $shareDir += '/' }
+    # 6.0 uses Ip + Share as one location. 4.3 uses ShareDir as the remote
+    # share and File as the remote file.
     return [pscustomobject]@{
         Ip       = $remoteIp
         Share    = $remoteShare
         Host     = $uri.Host
         ShareUrl = ($remoteIp.TrimEnd('/') + $remoteShare)
+        ShareDir = $shareDir
+        File     = $IsoFile
     }
 }
 
@@ -2120,6 +2125,7 @@ function New-CimcHuuTriggerBody {
         [Parameter(Mandatory)][string]$Cookie,
         [Parameter(Mandatory)][string]$RemoteIp,
         [Parameter(Mandatory)][string]$RemoteShare,
+        [string]$RemoteFile,
         [string]$ShareUser,
         [string]$SharePass,
         [Parameter(Mandatory)][string]$Component,
@@ -2129,18 +2135,77 @@ function New-CimcHuuTriggerBody {
     $safeCookie = ConvertTo-CimcXmlValue $Cookie
     $xmlUser = ConvertTo-CimcXmlValue $ShareUser
     $xmlPass = ConvertTo-CimcXmlValue $SharePass
-    # 6.0 accepts updateType, doForceDown, gracefulTimeout, and bootMedium.
-    # 4.3 maps the ISO without those fields. Sending them with bootMedium
-    # "vmedia" produced ISO Mapping Error before CIMC opened the URL.
+    # 6.0 accepts updateType, doForceDown, gracefulTimeout, and bootMedium,
+    # and puts the ISO name in remoteShare. 4.3 keeps remoteFile separate.
     $newer = ''
+    $fileAttr = ''
     if (-not $Legacy) { $newer = ' updateType="immediate" doForceDown="yes" gracefulTimeout="3" bootMedium="vmedia"' }
+    if ($RemoteFile) { $fileAttr = " remoteFile=`"$(ConvertTo-CimcXmlValue $RemoteFile)`"" }
     return @"
 <configConfMo cookie="$safeCookie" dn="sys/huu/firmwareUpdater" inHierarchical="false">
   <inConfig>
-    <huuFirmwareUpdater dn="sys/huu/firmwareUpdater" adminState="trigger" mapType="www" remoteIp="$(ConvertTo-CimcXmlValue $RemoteIp)" remoteShare="$(ConvertTo-CimcXmlValue $RemoteShare)" username="$xmlUser" password="$xmlPass" updateComponent="$(ConvertTo-CimcXmlValue $Component)" stopOnError="no" timeOut="$TimeoutMin" verifyUpdate="no"$newer status="modified"/>
+    <huuFirmwareUpdater dn="sys/huu/firmwareUpdater" adminState="trigger" mapType="www" remoteIp="$(ConvertTo-CimcXmlValue $RemoteIp)" remoteShare="$(ConvertTo-CimcXmlValue $RemoteShare)"$fileAttr username="$xmlUser" password="$xmlPass" updateComponent="$(ConvertTo-CimcXmlValue $Component)" stopOnError="no" timeOut="$TimeoutMin" verifyUpdate="no"$newer status="modified"/>
   </inConfig>
 </configConfMo>
 "@
+}
+
+function Set-CimcWwwVolume {
+    # 4.3 vMedia mapping has two fields. remoteShare is the directory URL.
+    # remoteFile is the ISO name. 6.0 consolidated those into one location.
+    param(
+        [Parameter(Mandatory)][string]$CimcIp,
+        [Parameter(Mandatory)][string]$Volume,
+        [Parameter(Mandatory)][string]$ShareDir,
+        [Parameter(Mandatory)][string]$IsoFile,
+        [string]$User,
+        [string]$Pass
+    )
+    $cookie = Connect-CimcXml -CimcIp $CimcIp
+    $safeCookie = ConvertTo-CimcXmlValue $cookie
+    $dn = "sys/svc-ext/vmedia-svc/vmmap-$Volume"
+    $safeDn = ConvertTo-CimcXmlValue $dn
+    $delete = @"
+<configConfMo cookie="$safeCookie" dn="$safeDn" inHierarchical="false">
+  <inConfig>
+    <commVMediaMap dn="$safeDn" status="deleted"/>
+  </inConfig>
+</configConfMo>
+"@
+    Send-CimcXmlRequest -CimcIp $CimcIp -Body $delete -TimeoutSec 60 | Out-Null
+    $share = $ShareDir
+    if (-not $share.EndsWith('/')) { $share += '/' }
+    Write-Log "Creating vMedia volume '$Volume'. Remote share '$share', remote file '$IsoFile'."
+    $body = @"
+<configConfMo cookie="$safeCookie" dn="$safeDn" inHierarchical="false">
+  <inConfig>
+    <commVMediaMap dn="$safeDn" volumeName="$(ConvertTo-CimcXmlValue $Volume)" map="www" remoteShare="$(ConvertTo-CimcXmlValue $share)" remoteFile="$(ConvertTo-CimcXmlValue $IsoFile)" username="$(ConvertTo-CimcXmlValue $User)" password="$(ConvertTo-CimcXmlValue $Pass)" mountOptions="noauto" status="created"/>
+  </inConfig>
+</configConfMo>
+"@
+    $created = Send-CimcXmlRequest -CimcIp $CimcIp -Body $body -TimeoutSec 90
+    if ($created -match 'errorCode="([^"]+)"' -and $Matches[1]) {
+        $why = ([regex]::Match($created, 'errorDescr="([^"]*)"')).Groups[1].Value
+        Write-Log -Level WARN "CIMC rejected the separate remote share and remote file: $why"
+        return $false
+    }
+    for ($i = 0; $i -lt 8; $i++) {
+        Start-Sleep -Seconds 5
+        $query = "<configResolveDn cookie=`"$safeCookie`" dn=`"$safeDn`" inHierarchical=`"false`"/>"
+        $text = Send-CimcXmlRequest -CimcIp $CimcIp -Body $query -TimeoutSec 30
+        $status = ([regex]::Match($text, 'mappingStatus="([^"]*)"')).Groups[1].Value
+        if ($status -match '^(?i)OK$') {
+            Write-Log "vMedia volume '$Volume' mapped. Remote share and remote file are separate on this firmware."
+            return $true
+        }
+        if ($status -match '(?i)error|fail') {
+            Write-Log -Level WARN "vMedia mapping status: $status"
+            return $false
+        }
+        if ($status) { Write-Log "vMedia mapping status: $status" }
+    }
+    Write-Log -Level WARN "vMedia volume '$Volume' did not reach OK."
+    return $false
 }
 
 function Invoke-CimcHuuUpgrade {
@@ -2155,6 +2220,8 @@ function Invoke-CimcHuuUpgrade {
         [string]$SharePass,
         [string]$MapRetryIp,
         [string]$MapRetryShare,
+        [string]$ShareDir,
+        [string]$RemoteFile,
         [Parameter(Mandatory)][object]$Fw
     )
     $component = if ($Fw.updateComponent) { [string]$Fw.updateComponent } else { 'all' }
@@ -2246,7 +2313,7 @@ function Invoke-CimcHuuUpgrade {
             }
             if ($failed.Count -gt 0 -or $overall -match '(?i)\b(fail|error)\b') {
                 $which = if ($failed.Count -gt 0) { $failed -join ', ' } else { $overall }
-                if ($overall -match '(?i)ISO Mapping Error' -and $mapAttempt -lt 2 -and $MapRetryIp -and $MapRetryShare) {
+                if ($overall -match '(?i)ISO Mapping Error' -and $mapAttempt -lt 1 -and $ShareDir -and $RemoteFile) {
                     $mapAttempt++
                     $retryPolls = 0
                     $oldEnd = $end
@@ -2255,21 +2322,15 @@ function Invoke-CimcHuuUpgrade {
                     $seenActive = $false
                     $lastSummary = ''
                     if (-not $cookie) { $cookie = Connect-CimcXml -CimcIp $CimcIp }
-                    if ($mapAttempt -eq 1) {
-                        Write-Log "CIMC reported ISO Mapping Error for $RemoteIp$RemoteShare and did not open that URL. Retrying without the 6.0-only HUU fields."
-                        $body = New-CimcHuuTriggerBody -Cookie $cookie -RemoteIp $RemoteIp -RemoteShare $RemoteShare `
-                            -ShareUser $ShareUser -SharePass $SharePass -Component $component -TimeoutMin $timeoutMin -Legacy
-                    }
-                    else {
-                        Write-Log "CIMC still could not map the ISO. Retrying with IP $MapRetryIp and share $MapRetryShare."
-                        $body = New-CimcHuuTriggerBody -Cookie $cookie -RemoteIp $MapRetryIp -RemoteShare $MapRetryShare `
-                            -ShareUser $ShareUser -SharePass $SharePass -Component $component -TimeoutMin $timeoutMin -Legacy
-                    }
+                    $retryIp = if ($MapRetryIp) { $MapRetryIp } else { $RemoteIp }
+                    Write-Log "CIMC reported ISO Mapping Error for the combined 6.0 location. Retrying with remote share '$ShareDir' and remote file '$RemoteFile'."
+                    $body = New-CimcHuuTriggerBody -Cookie $cookie -RemoteIp $retryIp -RemoteShare $ShareDir -RemoteFile $RemoteFile `
+                        -ShareUser $ShareUser -SharePass $SharePass -Component $component -TimeoutMin $timeoutMin -Legacy
                     $trigger = Send-CimcXmlRequest -CimcIp $CimcIp -Body $body -TimeoutSec 180
                     if ($trigger -match 'errorCode="([^"]+)"' -and $Matches[1]) {
                         $why = ([regex]::Match($trigger, 'errorDescr="([^"]*)"')).Groups[1].Value
-                        if (-not $why) { $why = 'CIMC rejected the HUU update request.' }
-                        throw $why
+                        if (-not $why) { $why = 'CIMC rejected the split HUU fields.' }
+                        throw "ISO Mapping Error: $why"
                     }
                     continue
                 }
@@ -2526,7 +2587,7 @@ function Invoke-FirmwareUpgrade {
         catch { Write-Log -Level WARN "Could not clear an earlier ISO mapping: $($_.Exception.Message)" }
         try {
             Invoke-CimcHuuUpgrade -CimcIp $TargetIp -RemoteIp $share.Ip -RemoteShare $share.Share `
-                -MapRetryIp $share.Host -MapRetryShare $share.ShareUrl `
+                -MapRetryIp $share.Host -MapRetryShare $share.ShareUrl -ShareDir $share.ShareDir -RemoteFile $share.File `
                 -ShareUser ([string]$fw.shareUser) -SharePass ([string]$fw.sharePassword) -Fw $fw
             $upgraded = $true
         }
@@ -2552,16 +2613,27 @@ function Invoke-FirmwareUpgrade {
             # 4.3 accepts the HUU job and then fails the mount before it opens
             # the URL. map-www is the mount that carries the port. A browser on
             # this laptop can download the ISO even when CIMC never connects.
+            $xmlMapped = $false
             if ($huuError -match '(?i)ISO Mapping Error') {
-                Write-Log 'The HUU API could not map the ISO and CIMC never opened the URL. Mapping it with map-www. A browser on this laptop is not the same as CIMC connecting.'
-                if (-not (Restore-CimcCli -Port $SerialPort)) {
-                    throw "$huuError The serial console is not answering, so map-www cannot run either."
+                Write-Log '4.3 keeps remote share and remote file separate. A browser on this laptop can open the URL even when CIMC has not connected.'
+                try {
+                    $xmlMapped = Set-CimcWwwVolume -CimcIp $TargetIp -Volume $volume -ShareDir $share.ShareDir -IsoFile $isoFile `
+                        -User ([string]$fw.shareUser) -Pass ([string]$fw.sharePassword)
+                }
+                catch {
+                    Write-Log -Level WARN "Separate vMedia mapping failed: $($_.Exception.Message)"
+                }
+                if ($xmlMapped -and $script:HttpLogState -and [string]$script:HttpLogState.Seen -notlike "*|$TargetIp|*") {
+                    Write-Log -Level WARN "The vMedia map is saved, but CIMC has not requested the ISO yet. A download from this laptop does not show that CIMC can reach the HTTP port."
                 }
             }
-            # CIMC did not accept the non-interactive job. Fall back to mapping
-            # the ISO and booting it so the HUU menu is reachable.
-            Set-CimcVmediaMap -Port $SerialPort -Config $Config -Volume $volume -BaseUrl $baseUrl -IsoFile $isoFile `
-                -User ([string]$fw.shareUser) -Pass ([string]$fw.sharePassword) | Out-Null
+            if (-not $xmlMapped) {
+                if ($huuError -match '(?i)ISO Mapping Error' -and -not (Restore-CimcCli -Port $SerialPort)) {
+                    throw "$huuError The serial console is not answering, so map-www cannot run either."
+                }
+                Set-CimcVmediaMap -Port $SerialPort -Config $Config -Volume $volume -BaseUrl $baseUrl -IsoFile $isoFile `
+                    -User ([string]$fw.shareUser) -Pass ([string]$fw.sharePassword) | Out-Null
+            }
             $bootOrderSet = $false
             try {
                 if (-not (Sync-CimcPrompt -Port $SerialPort -Attempts 3 -TimeoutSec 5)) {
