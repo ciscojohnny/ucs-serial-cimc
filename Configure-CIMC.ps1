@@ -1987,7 +1987,11 @@ function Connect-CimcXml {
         throw "CIMC XML login failed: $why"
     }
     $cookie = [regex]::Match($text, 'outCookie="([^"]+)"')
-    if (-not $cookie.Success) { throw 'CIMC XML login did not return a session cookie.' }
+    if (-not $cookie.Success) { $cookie = [regex]::Match($text, '\bcookie="(\d+/[^"]+)"') }
+    if (-not $cookie.Success) {
+        $why = if ([string]::IsNullOrWhiteSpace($text)) { 'CIMC returned an empty login response.' } else { "CIMC login response did not include a session cookie ($($text.Length) characters)." }
+        throw "CIMC XML login failed: $why"
+    }
     $script:CimcXmlCookie = $cookie.Groups[1].Value
     return $script:CimcXmlCookie
 }
@@ -2341,6 +2345,63 @@ function Set-CimcBootDeviceXml {
     return ''
 }
 
+function ConvertFrom-CimcBootDeviceXml {
+    param([string]$Text)
+    $devices = @()
+    if (-not $Text) { return ,$devices }
+    $flat = $Text -replace '\s+', ' '
+    foreach ($tag in [regex]::Matches($flat, '<(lsboot[A-Za-z0-9]+)\s+([^>]*dn="[^"]+"[^>]*)/?>')) {
+        $attrs = @{}
+        foreach ($pair in [regex]::Matches($tag.Groups[2].Value, '([A-Za-z0-9_]+)="([^"]*)"')) {
+            $attrs[$pair.Groups[1].Value] = $pair.Groups[2].Value
+        }
+        if ($tag.Groups[1].Value -eq 'lsbootDevPrecision') { continue }
+        if (-not $attrs['dn']) { continue }
+        $name = $attrs['name']
+        if (-not $name -and $attrs['rn']) { $name = ($attrs['rn'] -replace '^vm-','') }
+        if (-not $name) { continue }
+        $devices += [pscustomobject]@{
+            Class   = $tag.Groups[1].Value
+            Name    = $name
+            Dn      = $attrs['dn']
+            Type    = $attrs['type']
+            Subtype = $attrs['subtype']
+        }
+    }
+    return ,$devices
+}
+
+function Get-CimcPrecisionBootDevices {
+    # The hierarchical boot-precision read often omits devices that are already
+    # there. The children and class queries are what find an existing vDVD.
+    param(
+        [Parameter(Mandatory)][string]$CimcIp,
+        [Parameter(Mandatory)][string]$Cookie
+    )
+    $safeCookie = ConvertTo-CimcXmlValue $Cookie
+    $queries = @(
+        "<configResolveDn cookie=`"$safeCookie`" dn=`"sys/rack-unit-1/boot-precision`" inHierarchical=`"true`"/>",
+        "<configResolveChildren cookie=`"$safeCookie`" inDn=`"sys/rack-unit-1/boot-precision`" inHierarchical=`"false`"/>",
+        "<configResolveClass cookie=`"$safeCookie`" classId=`"lsbootVMedia`" inHierarchical=`"false`"/>"
+    )
+    $devices = @()
+    foreach ($query in $queries) {
+        $text = Send-CimcXmlRequest -CimcIp $CimcIp -Body $query -TimeoutSec 60
+        if ($text -match 'errorCode="([^"]+)"' -and $Matches[1]) {
+            $why = ([regex]::Match($text, 'errorDescr="([^"]*)"')).Groups[1].Value
+            if ($devices.Count -eq 0) { Write-Log -Level WARN "Could not read the precision boot order: $why" }
+            continue
+        }
+        foreach ($item in @(ConvertFrom-CimcBootDeviceXml -Text $text)) {
+            if ($item.Dn -notlike 'sys/rack-unit-1/boot-precision/*') { continue }
+            if ((@($devices | Where-Object { $_.Dn -eq $item.Dn }).Count -eq 0)) { $devices += $item }
+        }
+        $hasDvd = @($devices | Where-Object { $_.Subtype -match '(?i)cimc-mapped-dvd' -or $_.Class -eq 'lsbootVMedia' }).Count -gt 0
+        if ($hasDvd -and $devices.Count -gt 1) { break }
+    }
+    return ,$devices
+}
+
 function Set-CimcMappedDvdBoot {
     # Put the CIMC-mapped DVD first so the host boots the mapped HUU ISO.
     # Each device is its own request. CIMC rejects a parent and child in one.
@@ -2353,30 +2414,9 @@ function Set-CimcMappedDvdBoot {
     $lunName = if ($Fw.localBootName) { [string]$Fw.localBootName } else { 'LocalLUN' }
     $shellName = if ($Fw.uefiShellName) { [string]$Fw.uefiShellName } else { 'UefiShell' }
     $cookie = Connect-CimcXml -CimcIp $CimcIp
-    $safeCookie = ConvertTo-CimcXmlValue $cookie
-    $query = "<configResolveDn cookie=`"$safeCookie`" dn=`"sys/rack-unit-1/boot-precision`" inHierarchical=`"true`"/>"
-    $text = Send-CimcXmlRequest -CimcIp $CimcIp -Body $query -TimeoutSec 60
-    if ($text -match 'errorCode="([^"]+)"' -and $Matches[1]) {
-        $why = ([regex]::Match($text, 'errorDescr="([^"]*)"')).Groups[1].Value
-        Write-Log -Level WARN "Could not read the precision boot order: $why"
-        return $false
-    }
-    $flat = $text -replace '\s+', ' '
-    $devices = @()
-    foreach ($tag in [regex]::Matches($flat, '<(lsboot[A-Za-z0-9]+)\s+([^>]*dn="[^"]+"[^>]*)/?>')) {
-        $attrs = @{}
-        foreach ($pair in [regex]::Matches($tag.Groups[2].Value, '([A-Za-z0-9_]+)="([^"]*)"')) {
-            $attrs[$pair.Groups[1].Value] = $pair.Groups[2].Value
-        }
-        if ($tag.Groups[1].Value -eq 'lsbootDevPrecision') { continue }
-        if (-not $attrs['dn'] -or -not $attrs['name']) { continue }
-        $devices += [pscustomobject]@{
-            Class   = $tag.Groups[1].Value
-            Name    = $attrs['name']
-            Dn      = $attrs['dn']
-            Type    = $attrs['type']
-            Subtype = $attrs['subtype']
-        }
+    $devices = @(Get-CimcPrecisionBootDevices -CimcIp $CimcIp -Cookie $cookie)
+    if ($devices.Count -gt 0) {
+        Write-Log ("Precision boot list: " + (($devices | ForEach-Object { $_.Name }) -join ', '))
     }
     $dvd = @($devices | Where-Object { $_.Subtype -match '(?i)cimc-mapped-dvd' -or $_.Name -eq $dvdName } | Select-Object -First 1)
     if ($dvd.Count -eq 0) {
@@ -2384,12 +2424,19 @@ function Set-CimcMappedDvdBoot {
         Write-Log "Creating precision boot device '$dvdName' (CIMC-mapped DVD)."
         $why = Set-CimcBootDeviceXml -CimcIp $CimcIp -Cookie $cookie -ClassName 'lsbootVMedia' -Dn $dn `
             -Order 1 -Name $dvdName -Type 'VMEDIA' -Subtype 'cimc-mapped-dvd' -State 'Enabled' -Status 'created'
-        if ($why) {
+        if ($why -and $why -notmatch '(?i)already exists') {
             Write-Log -Level WARN "Could not create boot device '$dvdName': $why"
             return $false
         }
-        $devices += [pscustomobject]@{ Class = 'lsbootVMedia'; Name = $dvdName; Dn = $dn; Type = 'VMEDIA'; Subtype = 'cimc-mapped-dvd' }
-        $dvd = @($devices | Where-Object { $_.Name -eq $dvdName } | Select-Object -First 1)
+        if ($why) {
+            Write-Log "Boot device '$dvdName' is already in the precision boot list. Setting it first."
+            $devices = @(Get-CimcPrecisionBootDevices -CimcIp $CimcIp -Cookie $cookie)
+        }
+        $dvd = @($devices | Where-Object { $_.Subtype -match '(?i)cimc-mapped-dvd' -or $_.Name -eq $dvdName } | Select-Object -First 1)
+        if ($dvd.Count -eq 0) {
+            $devices += [pscustomobject]@{ Class = 'lsbootVMedia'; Name = $dvdName; Dn = $dn; Type = 'VMEDIA'; Subtype = 'cimc-mapped-dvd' }
+            $dvd = @($devices | Where-Object { $_.Name -eq $dvdName } | Select-Object -First 1)
+        }
     }
     $kvm = @($devices | Where-Object { $_.Name -eq $kvmName -or $_.Subtype -match '(?i)kvm-mapped-dvd' } | Select-Object -First 1)
     $lun = @($devices | Where-Object { $_.Name -eq $lunName -or $_.Type -match '(?i)^LOCALHDD$' } | Select-Object -First 1)
