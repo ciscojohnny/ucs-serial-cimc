@@ -3,7 +3,7 @@
 PowerShell script that drives the CIMC CLI over the serial console. It sets
 networking, DNS, NTP, hostname, and the Intersight Device Connector. With the
 firmware step on, it serves a Host Upgrade Utility ISO and has CIMC update and
-activate every component. CIMC boots that ISO as part of the upgrade.
+activate every component except the drives. CIMC boots that ISO as part of the upgrade.
 
 The script configures **one server at a time** over a single serial port. All
 editable values live in a single **JSONC** file (`cimc-config.jsonc`). JSONC is
@@ -33,8 +33,8 @@ In this order:
 3. Enable NTP, then load up to four NTP servers and the timezone.
 4. Enable the Intersight Device Connector, and a proxy if one is configured.
 5. If `firmware.enabled` is true, or you pass `-Firmware`, run the HUU upgrade.
-   CIMC mounts the ISO, updates and activates every component, then the script
-   puts the boot drive first. If the automatic job cannot start, the script
+   CIMC mounts the ISO, updates and activates every component except the drives,
+   then the script puts the boot drive first. If the automatic job cannot start, the script
    maps the ISO and boots it so you can choose Update and Activate on the HUU screen.
 
 `site.disableIpv6` turns IPv6 off on the management port. `site.vlanEnabled`
@@ -58,6 +58,19 @@ password and never changes it.
     over that network, not over serial.
   - A static IPv4 on that Ethernet NIC in the CIMC subnet.
   - Python 3 when `firmware.transport` is `"http-local"`.
+
+## Standalone models and firmware
+
+This script talks to standalone CIMC, not UCS Manager. It is tested on a C220 M7S running CIMC 6.0 and a C220 M7N running CIMC 4.3. C220 and C240 M5, M6, and M7 use the same CLI shape. The command text and the HUU fields still change with the firmware, so a path that works on one build stays in place when another build needs a different command.
+
+| Step | CIMC 6.0 | CIMC 4.3 |
+| --- | --- | --- |
+| Timezone | `timezone-select`. The US list says `Central Time`. | Same command. Older menus say `Central (most areas)`. |
+| Device Connector | `scope device-connector`. `scope cloud` is rejected. | `scope cimc` then `scope device-connector`, or `scope cloud` on older builds. |
+| HUU ISO address | `remoteIp` is `http://host:port` and `remoteShare` is `/file.iso`. | `remoteIp` is the bare IP and `remoteShare` is the full `http://` URL. |
+| Drives | `updateComponent` `all` skips drives. | Same token. `all,hdd` is the only value that includes drives. |
+
+An empty precision boot list is normal. The script leaves the BIOS default order in place. It does not enable UEFI secure boot, and a configuration-only run does not reboot the host.
 
 ## Editing `cimc-config.jsonc`
 

@@ -13,11 +13,20 @@
         4. Enable the Intersight Device Connector.
         5. If firmware.enabled is true (or -Firmware is passed), serve the HUU
            ISO and have CIMC update and activate every component except the
-           drives. CIMC boots
-           the ISO as part of that job.
+           drives. CIMC boots the ISO as part of that job.
 
 .NOTES
-    Tested against CIMC 4.x / 5.x CLI (UCS C220/C240 M5/M6/M7).
+    Standalone CIMC only (not UCS Manager). Tested on C220 M7S with CIMC 6.0
+    and C220 M7N with CIMC 4.3. M5/M6/M7 share the CLI shape; command text and
+    the HUU XML fields do not. Keep both forms when they differ:
+      Timezone: timezone-select. Newer menus say "Central Time"; older menus
+        say "Central (most areas)". Leave the menu with answers, not Ctrl-C.
+      Device Connector: scope device-connector, then cimc/device-connector,
+        then scope cloud. "% invalid command" means try the next scope.
+      HUU www map: 6.0 takes remoteIp "http://host:port" and remoteShare
+        "/file.iso". 4.3 takes a bare IP in remoteIp and the full http URL
+        in remoteShare. Retry the 4.3 form after ISO Mapping Error.
+      updateComponent "all" skips drives. "all,hdd" includes them.
     Requires PowerShell 5.1+ or 7+ on Windows with access to a serial adapter.
 
 .EXAMPLE

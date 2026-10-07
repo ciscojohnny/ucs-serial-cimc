@@ -480,6 +480,9 @@ included the firmware step, wait until that job finishes before you unplug.
 
 With the firmware step on, the script serves a Cisco Host Upgrade Utility ISO
 and tells CIMC to update and activate every component in it except the drives.
+C220 M7S on CIMC 6.0 and C220 M7N on CIMC 4.3 are both supported. Where those
+builds disagree, the script keeps both command forms. See the firmware table
+in the README.
 CIMC boots the ISO itself. You do not drive the HUU screen. Leave the script
 window open until the log says the job finished. A configuration-only run does
 not reboot the host.
