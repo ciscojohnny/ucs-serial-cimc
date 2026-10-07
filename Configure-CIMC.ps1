@@ -1164,7 +1164,20 @@ function Test-IsoHttpReachable {
         try {
             $code = [int]$resp.StatusCode
             Write-Log "Local check of $Url returned HTTP $code."
-            return ($code -eq 200 -or $code -eq 206)
+            if ($Range) {
+                if ($code -ne 206) {
+                    Write-Log -Level WARN "The server ignored the Range request. CIMC vMedia requires HTTP 206 Partial Content."
+                    return $false
+                }
+                $contentRange = [string]$resp.Headers['Content-Range']
+                $acceptRanges = [string]$resp.Headers['Accept-Ranges']
+                if ($contentRange -notmatch '^bytes\s+0-15/\d+$' -or $acceptRanges -notmatch '(?i)\bbytes\b') {
+                    Write-Log -Level WARN "The HTTP 206 response is missing valid byte-range headers (Content-Range='$contentRange', Accept-Ranges='$acceptRanges')."
+                    return $false
+                }
+                return $true
+            }
+            return ($code -eq 200)
         } finally {
             $resp.Close()
         }
@@ -1220,6 +1233,13 @@ except ImportError:
         daemon_threads = True
 
 class IsoHandler(SimpleHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def __init__(self, *args, **kwargs):
+        self.range_to_send = None
+        self.sent_accept_ranges = False
+        super().__init__(*args, **kwargs)
+
     def translate_path(self, path):
         path = urllib.parse.urlsplit(path).path
         path = urllib.parse.unquote(path)
@@ -1232,15 +1252,89 @@ class IsoHandler(SimpleHTTPRequestHandler):
             out = os.path.join(out, word)
         return out
 
+    def send_header(self, keyword, value):
+        if keyword.lower() == "accept-ranges":
+            self.sent_accept_ranges = True
+        super().send_header(keyword, value)
+
+    def end_headers(self):
+        if not self.sent_accept_ranges:
+            self.send_header("Accept-Ranges", "bytes")
+        super().end_headers()
+
+    def send_head(self):
+        self.range_to_send = None
+        self.sent_accept_ranges = False
+        raw_range = self.headers.get("Range")
+        if not raw_range:
+            return super().send_head()
+
+        path = self.translate_path(self.path)
+        if not os.path.isfile(path):
+            return super().send_head()
+
+        try:
+            file_size = os.path.getsize(path)
+            unit, separator, value = raw_range.strip().partition("=")
+            if unit.lower() != "bytes" or not separator or "," in value:
+                raise ValueError("unsupported range")
+            first, dash, last = value.partition("-")
+            if not dash:
+                raise ValueError("invalid range")
+            if first:
+                start = int(first)
+                end = int(last) if last else file_size - 1
+            else:
+                suffix_length = int(last)
+                if suffix_length <= 0:
+                    raise ValueError("invalid suffix range")
+                start = max(0, file_size - suffix_length)
+                end = file_size - 1
+            if start < 0 or start >= file_size or end < start:
+                raise ValueError("range outside file")
+            end = min(end, file_size - 1)
+            source = open(path, "rb")
+        except (OSError, ValueError):
+            self.send_response(416)
+            self.send_header("Content-Range", "bytes */%d" % (
+                os.path.getsize(path) if os.path.isfile(path) else 0
+            ))
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return None
+
+        self.range_to_send = (start, end)
+        self.send_response(206)
+        self.send_header("Content-Type", self.guess_type(path))
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Range", "bytes %d-%d/%d" % (
+            start, end, file_size
+        ))
+        self.send_header("Content-Length", str(end - start + 1))
+        self.send_header("Last-Modified", self.date_time_string(
+            os.path.getmtime(path)
+        ))
+        self.end_headers()
+        return source
+
     def log_message(self, fmt, *args):
         sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
         sys.stderr.flush()
 
     def copyfile(self, source, outputfile):
-        # The local check closes the socket after the status line. Python then
-        # raises while sending the body. That is not a failed mount.
         try:
-            super().copyfile(source, outputfile)
+            if self.range_to_send is None:
+                super().copyfile(source, outputfile)
+                return
+            start, end = self.range_to_send
+            source.seek(start)
+            remaining = end - start + 1
+            while remaining > 0:
+                chunk = source.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                outputfile.write(chunk)
+                remaining -= len(chunk)
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             pass
 
@@ -1651,7 +1745,7 @@ function Invoke-FirmwareUpgrade {
                 throw "This laptop cannot open http://${serveHost}:${listenPort}/ (port $listenPort). http://127.0.0.1:${listenPort}/ works, so Python is running and Windows is blocking the Ethernet address. $admin"
             }
             if (-not (Test-IsoHttpReachable -Url "${baseUrl}${isoFile}" -Range)) {
-                throw "The server is up at $baseUrl but the ISO URL ${baseUrl}${isoFile} did not return the file. Check firmware.isoFile and that the file is directly in the serve folder."
+                throw "The server is up at $baseUrl but the ISO URL failed its byte-range test. CIMC requires HTTP 206 Partial Content with Content-Range and Accept-Ranges headers. Check firmware.isoFile and that the file is directly in the serve folder."
             }
             if (-not (Test-IsoHttpReachable -Url ("http://{0}:{1}//{2}" -f $serveHost, $listenPort, $isoFile) -Range)) {
                 throw "The server rejected the double-slash ISO URL CIMC sometimes requests."
