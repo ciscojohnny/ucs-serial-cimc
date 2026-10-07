@@ -472,6 +472,18 @@ function Sync-CimcPrompt {
     return $false
 }
 
+function Restore-CimcCli {
+    # A commit in the wrong scope can leave the serial CLI silent. Enter often
+    # does nothing then. Ctrl-C returns to the prompt without the ESC+9 wake,
+    # which would switch away from an already-open session.
+    param([Parameter(Mandatory)][System.IO.Ports.SerialPort]$Port)
+    if (Sync-CimcPrompt -Port $Port -Attempts 2 -TimeoutSec 3) { return $true }
+    Write-Log 'Serial console is quiet. Sending Ctrl-C to return to the prompt.'
+    try { $Port.Write([string][char]3) } catch {}
+    Start-Sleep -Milliseconds 400
+    return (Sync-CimcPrompt -Port $Port -Attempts 3 -TimeoutSec 4)
+}
+
 function Send-CimcBestEffort {
     <#
         Send an OPTIONAL command. If the console answers nothing before the
@@ -1098,9 +1110,41 @@ function Enable-IntersightDeviceConnector {
         }
         if ($rejected -or $resp -notmatch '(?i)/(device-connector|cloud)\s*#') { continue }
 
-        $enable = Send-CimcConfirm -Port $Port -Command 'set enabled yes' -TimeoutSec $cmdTO -InterDelayMs $delayMs
+        $detail = ''
+        try {
+            $detail = Send-Command -Port $Port -Command 'show detail' `
+                -ExpectPatterns @('#\s*$') -TimeoutSec 15 -InterDelayMs $delayMs
+        }
+        catch {
+            Write-Log -Level WARN "Device Connector 'show detail' did not return: $($_.Exception.Message)"
+            Restore-CimcCli -Port $Port | Out-Null
+            continue
+        }
+        if ($detail -match '(?i)Enabled\s*:\s*yes') {
+            Write-Log 'Device Connector is already enabled.'
+            Send-Command -Port $Port -Command 'top' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+            return
+        }
+        if ($detail -match '(?i)Update Stage|DC FW Version') {
+            Write-Log "Scope '$(($path -join ' / '))' updates connector firmware. Leaving it without commit."
+            continue
+        }
+
+        $enable = ''
+        try {
+            $enable = Send-CimcConfirm -Port $Port -Command 'set enabled yes' -TimeoutSec 15 -InterDelayMs $delayMs
+        }
+        catch {
+            Write-Log -Level WARN "Device Connector 'set enabled' did not return: $($_.Exception.Message)"
+            Restore-CimcCli -Port $Port | Out-Null
+            continue
+        }
         if ($enable -match '(?i)invalid command|unrecognized') {
             Write-Log "Scope '$(($path -join ' / '))' rejected 'set enabled'. Leaving it without commit."
+            continue
+        }
+        if ($enable -notmatch '\*#') {
+            Write-Log 'Device Connector set did not stage a change. Not committing.'
             continue
         }
         $configured = $true
@@ -2473,7 +2517,11 @@ function Invoke-FirmwareUpgrade {
         $script:HuuJobStarted = $false
         $huuError = $null
         # HUU mounts the ISO itself. A volume left from an earlier run can hold
-        # the CIMC-mapped DVD slot and stop that mount.
+        # the CIMC-mapped DVD slot and stop that mount. Recover the prompt
+        # first: a Device Connector commit on 4.3 can leave the CLI silent.
+        if (-not (Restore-CimcCli -Port $SerialPort)) {
+            Write-Log -Level WARN 'The serial console did not return a prompt before the ISO unmap.'
+        }
         try { Remove-CimcVmediaMap -Port $SerialPort -Config $Config -Volume $volume }
         catch { Write-Log -Level WARN "Could not clear an earlier ISO mapping: $($_.Exception.Message)" }
         try {
@@ -2497,10 +2545,19 @@ function Invoke-FirmwareUpgrade {
             Write-Host ''
             Write-Host "Firmware update and activate finished. The server is set to boot its drive." -ForegroundColor Yellow
         }
-        elseif ($script:HuuJobStarted) {
+        elseif ($script:HuuJobStarted -and $huuError -notmatch '(?i)ISO Mapping Error') {
             throw $huuError
         }
         else {
+            # 4.3 accepts the HUU job and then fails the mount before it opens
+            # the URL. map-www is the mount that carries the port. A browser on
+            # this laptop can download the ISO even when CIMC never connects.
+            if ($huuError -match '(?i)ISO Mapping Error') {
+                Write-Log 'The HUU API could not map the ISO and CIMC never opened the URL. Mapping it with map-www. A browser on this laptop is not the same as CIMC connecting.'
+                if (-not (Restore-CimcCli -Port $SerialPort)) {
+                    throw "$huuError The serial console is not answering, so map-www cannot run either."
+                }
+            }
             # CIMC did not accept the non-interactive job. Fall back to mapping
             # the ISO and booting it so the HUU menu is reachable.
             Set-CimcVmediaMap -Port $SerialPort -Config $Config -Volume $volume -BaseUrl $baseUrl -IsoFile $isoFile `
@@ -2521,7 +2578,7 @@ function Invoke-FirmwareUpgrade {
                 Write-Host ''
                 if ($bootOrderSet) {
                     Write-Host "Automatic HUU did not start. The ISO is mapped and the server is booting to it." -ForegroundColor Yellow
-                    Write-Host "In the HUU screen, choose Update and Activate for all components." -ForegroundColor Yellow
+                    Write-Host "In the HUU screen, choose Update and Activate for all components except the drives." -ForegroundColor Yellow
                 } else {
                     Write-Host "Automatic HUU did not start, and the serial console stopped answering." -ForegroundColor Yellow
                     Write-Host "In CIMC, boot the mapped vDVD, then choose Update and Activate for all components." -ForegroundColor Yellow
