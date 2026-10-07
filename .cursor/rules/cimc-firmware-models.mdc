@@ -11,9 +11,9 @@ Edits target standalone CIMC on C220/C240 M5, M6, and M7 (including M7N and M7S)
 When the CLI or the HUU XML disagrees, try the newer form and keep the fallback. Do not collapse both into the command that succeeded on the last server.
 
 - Timezone is `timezone-select` under `scope cimc`. Match both `Central Time` and `Central (most areas)`. Exit a failed menu with answers, not Ctrl-C.
-- Device Connector settings are `scope device-connector` or `scope cloud`. If `show detail` already says `Enabled: yes`, do not set or commit. On 4.3, `scope cimc` then `scope device-connector` is the firmware-update scope. If `set enabled` is rejected, do not `commit`; that commit hangs the serial CLI. An ISO Mapping Error then creates the separate 4.3 vMedia map, and `map-www` is the last fallback.
+- Do not enable the Device Connector. It is already enabled, and on 4.3 a commit in the firmware-update scope hangs the serial CLI.
 - NTP enabled is the line `Enabled: yes`. A line that starts with `NTP` is the wrong check.
-- vMedia on 4.3 has separate remote share (`http://host:port/`) and remote file (the ISO name). 6.0 consolidates those into one location: `remoteIp=http://host:port` and `remoteShare=/file.iso`. On `ISO Mapping Error`, retry with the two 4.3 fields, then create `commVMediaMap` the same way. Do not put the filename in the share on 4.3.
+- vMedia on 4.3 has separate remote share (`http://host:port/`) and remote file (the ISO name). 6.0 consolidates those into one location: `remoteIp=http://host:port` and `remoteShare=/file.iso`. Do not send `remoteFile` on `huuFirmwareUpdater`; 4.3 rejects that attribute. On `ISO Mapping Error`, create `commVMediaMap` with the two fields, set the CIMC-mapped DVD first over HTTPS, and power-cycle the host over HTTPS. `map-www` is only the fallback when that HTTPS map fails.
 - `updateComponent` defaults to `all`, which skips drives. `all,hdd` includes drives. Do not switch the default.
 - Do not send `set enabled yes` plus commit under `scope vmedia`, do not send `set low-power-usb-enabled no`, and do not run `show mappings`. `map-www` needs the space before the filename. Send a blank username, not `anonymous`.
 - An empty precision boot list is valid. Do not fail the run because `LocalLUN` is missing.

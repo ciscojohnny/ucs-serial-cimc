@@ -1,7 +1,8 @@
 # UCS C-Series CIMC Configuration (Serial)
 
 PowerShell script that drives the CIMC CLI over the serial console. It sets
-networking, DNS, NTP, hostname, and the Intersight Device Connector. With the
+networking, DNS, NTP, and hostname. The Device Connector is already enabled,
+so the script leaves it alone. With the
 firmware step on, it serves a Host Upgrade Utility ISO and has CIMC update and
 activate every component except the drives. CIMC boots that ISO as part of the upgrade.
 
@@ -31,11 +32,11 @@ In this order:
 2. Set NIC mode, static IPv4, DNS, hostname, and DNS domain. A hostname change
    regenerates the CIMC certificate. The script answers that prompt.
 3. Enable NTP, then load up to four NTP servers and the timezone.
-4. Enable the Intersight Device Connector, and a proxy if one is configured.
-5. If `firmware.enabled` is true, or you pass `-Firmware`, run the HUU upgrade.
+4. If `firmware.enabled` is true, or you pass `-Firmware`, run the HUU upgrade.
    CIMC mounts the ISO, updates and activates every component except the drives,
    then the script puts the boot drive first. If the automatic job cannot start, the script
-   maps the ISO and boots it so you can choose Update and Activate on the HUU screen.
+   maps the ISO, puts the CIMC-mapped DVD first in the boot order, and power-cycles
+   the host onto that DVD.
 
 `site.disableIpv6` turns IPv6 off on the management port. `site.vlanEnabled`
 tags that port. CIMC settings apply when they are committed, so the script does
@@ -66,8 +67,8 @@ This script talks to standalone CIMC, not UCS Manager. It is tested on a C220 M7
 | Step | CIMC 6.0 | CIMC 4.3 |
 | --- | --- | --- |
 | Timezone | `timezone-select`. The US list says `Central Time`. | Same command. Older menus say `Central (most areas)`. |
-| Device Connector | `scope device-connector` accepts `set enabled yes`. | `scope cloud` is the settings scope. `scope cimc / scope device-connector` only updates connector firmware, and a commit there hangs the CLI. |
-| HUU / vMedia location | One location: `remoteIp` is `http://host:port` and `remoteShare` is `/file.iso`. | Remote share and remote file stay separate. The share is `http://host:port/` and the file is the ISO name. |
+| HUU / vMedia location | One location: `remoteIp` is `http://host:port` and `remoteShare` is `/file.iso`. | Remote share and remote file stay separate. The share is `http://host:port/` and the file is the ISO name. The HUU object rejects `remoteFile`. |
+| Boot into that ISO | The HUU job boots the ISO itself. | After the vMedia map, the CIMC-mapped DVD is set first and the host is power-cycled over HTTPS. |
 | Drives | `updateComponent` `all` skips drives. | Same token. `all,hdd` is the only value that includes drives. |
 
 An empty precision boot list is normal. The script leaves the BIOS default order in place. It does not enable UEFI secure boot, and a configuration-only run does not reboot the host.
@@ -172,7 +173,7 @@ Passwords are never written to `cimc-config.jsonc` and never appear in the log.
 
 ## Intersight claim
 
-The script enables the Device Connector and commits the configuration. To
+The Device Connector is already enabled. The script does not change it. To
 claim the server in Intersight, browse to the CIMC web UI at the IP you just
 configured, open **Admin → Device Connector**, and copy the Device ID and
 Claim Code shown there into Intersight: **Targets → Claim a New Target → Cisco
@@ -189,9 +190,8 @@ UCS Standalone**.
 | `Timeout waiting for pattern(s): login:`                      | Baud rate / wiring / wrong physical port (use the rear console jack). After a factory reset, wait — CIMC boot can take several minutes. |
 | Script appears stuck at "Probing CIMC prompt..."              | Another app (PuTTY / SecureCRT / Tera Term / `screen`) has the serial port open, or CIMC is still booting. |
 | HUU job does not start, or the ISO never downloads           | Laptop Ethernet is not on the CIMC subnet, the firewall blocks `servePort`, the ISO name is wrong, or Python is not installed. |
-| `ISO Mapping Error`                                           | CIMC accepted the 6.0 location and never opened it. On 4.3 the script retries with a separate remote share and remote file, then creates that vMedia mapping. Confirm the CIMC IP can reach the laptop address and port. |
+| `ISO Mapping Error`                                           | The HUU job could not mount the ISO. On 4.3 the script maps the remote share and remote file, puts the CIMC-mapped DVD first, and power-cycles the host. Leave the window open until HUU finishes. |
 | `create-boot-device` / `set subtype` / `power cycle` rejected | Automatic HUU did not start, and a fallback boot token was rejected. Adjust the names in the `"firmware"` block and retry. |
 | `Authentication failed with both supplied and factory-default passwords` | Someone has changed the CIMC password and the value typed at the prompt is wrong. |
-| `Could not enter the Device Connector scope`                  | The script tried `device-connector`, `cimc/device-connector`, and `cloud`. Enable it under **Admin → Device Connector**. |
 | `active-active` rejected                                      | Only valid with a `shared_lom*` NIC mode. Use `none` with `dedicated`. |
 | `Network commit did not return to CLI prompt …`               | CIMC produced an unexpected confirmation prompt; check the session log under `logs/` for the last RX. |

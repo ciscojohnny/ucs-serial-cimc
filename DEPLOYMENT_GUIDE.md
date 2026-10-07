@@ -261,17 +261,10 @@ If you're unsure about `nicMode` / `nicRedundancy`, the defaults above are
 correct for most C-Series deployments. Leave `disableIpv6` as `true` to disable
 IPv6 (the default); set it to `false` to leave IPv6 untouched.
 
-#### 5b. Intersight settings
+The Device Connector is already enabled on these servers. The script does not
+change it. Claim the server from **Admin → Device Connector** after the run.
 
-```jsonc
-"intersight": {
-    "enableDeviceConnector": true,   // leave true
-    "proxyHost":             null,    // only set if CIMC must use a proxy
-    "proxyPort":             null
-}
-```
-
-#### 5c. Serial port settings
+#### 5b. Serial port settings
 
 The defaults match Cisco's default CIMC serial settings (`115200 / 8 / N / 1`).
 Only change these if your adapter is configured differently.
@@ -286,7 +279,7 @@ Only change these if your adapter is configured differently.
 }
 ```
 
-#### 5d. Behavior
+#### 5c. Behavior
 
 Timeouts. The defaults are fine for most environments.
 
@@ -298,7 +291,7 @@ Timeouts. The defaults are fine for most environments.
 }
 ```
 
-#### 5e. The `"servers"` list — one entry per server
+#### 5d. The `"servers"` list — one entry per server
 
 This is your inventory of every UCS server you plan to configure. The script
 applies only the entry whose `hostName` matches the `-HostName` you pass on the

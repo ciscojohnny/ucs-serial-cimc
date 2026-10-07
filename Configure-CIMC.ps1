@@ -10,8 +10,7 @@
         1. Log in. Change the admin password only if CIMC is still at factory default.
         2. Set NIC mode, static IPv4, DNS, hostname, and DNS domain.
         3. Enable NTP, load the NTP servers, and set the timezone.
-        4. Enable the Intersight Device Connector.
-        5. If firmware.enabled is true (or -Firmware is passed), serve the HUU
+        4. If firmware.enabled is true (or -Firmware is passed), serve the HUU
            ISO and have CIMC update and activate every component except the
            drives. CIMC boots the ISO as part of that job.
 
@@ -21,13 +20,12 @@
     the HUU XML fields do not. Keep both forms when they differ:
       Timezone: timezone-select. Newer menus say "Central Time"; older menus
         say "Central (most areas)". Leave the menu with answers, not Ctrl-C.
-      Device Connector: settings live in scope device-connector or scope cloud.
-        On 4.3, scope cimc / scope device-connector is the firmware-update
-        scope. If "set enabled" is rejected, do not commit; that commit hangs.
+      Device Connector is already enabled. This script does not change it.
       HUU www map: 6.0 takes one location, remoteIp "http://host:port" and
         remoteShare "/file.iso". 4.3 keeps remote share (http://host:port/)
-        and remote file (the ISO name) separate. ISO Mapping Error then
-        creates that vMedia mapping.
+        and remote file (the ISO name) separate, on the vMedia map. The HUU
+        object rejects a remoteFile attribute. After that map, boot order and
+        the host power cycle are sent over HTTPS.
       updateComponent "all" skips drives. "all,hdd" includes them.
     Requires PowerShell 5.1+ or 7+ on Windows with access to a serial adapter.
 
@@ -167,7 +165,7 @@ function Read-CimcConfig {
     $cfg = ConvertFrom-Jsonc -Text $raw
 
     # Validate top-level structure.
-    foreach ($section in 'site','intersight','serial','behavior','servers') {
+    foreach ($section in 'site','serial','behavior','servers') {
         if (-not $cfg.PSObject.Properties.Name -contains $section) {
             throw "Config file missing required section: '$section'."
         }
@@ -493,8 +491,7 @@ function Send-CimcBestEffort {
         configuration has already been committed.
 
         Input is drained first so a stale prompt left over from a previous
-        command cannot satisfy this command's read (that drift is what starved
-        the Device Connector settings on C220 M7N).
+        command cannot satisfy this command's read.
 
         Returns the console text, or $null when the command produced no reply.
     #>
@@ -1070,117 +1067,6 @@ function Set-CimcTimezone {
             try { Exit-CimcTimezoneMenu -Port $Port -Menu $menu -TimeoutSec $menuTimeout -InterDelayMs $InterDelayMs }
             catch { Write-Log -Level WARN "Could not leave the timezone menu: $($_.Exception.Message)" }
         }
-    }
-}
-
-function Enable-IntersightDeviceConnector {
-    param(
-        [Parameter(Mandatory)][System.IO.Ports.SerialPort]$Port,
-        [Parameter(Mandatory)][object]$Config
-    )
-
-    if (-not [bool]$Config.intersight.enableDeviceConnector) { return }
-
-    $cmdTO   = [int]$Config.behavior.commandTimeoutSec
-    $delayMs = [int]$Config.behavior.interCommandDelayMs
-
-    Write-Log 'Enabling Intersight Device Connector (Cloud management).'
-
-    # 6.0 enables the connector from "scope device-connector" or "scope cloud".
-    # On 4.3, "scope cimc / scope device-connector" is the firmware-update scope:
-    # "set enabled" is rejected there, and a commit with nothing staged hangs
-    # the serial CLI. Try each scope, and commit only after a set is accepted.
-    $paths = @(
-        ,@('scope device-connector')
-        ,@('scope cloud')
-        ,@('scope cimc', 'scope cloud')
-        ,@('scope cimc', 'scope device-connector')
-    )
-    $configured = $false
-    foreach ($path in $paths) {
-        Send-Command -Port $Port -Command 'top' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-        $resp = ''
-        $rejected = $false
-        foreach ($cmd in $path) {
-            $resp = Send-Command -Port $Port -Command $cmd `
-                -ExpectPatterns @('#\s*$', '(?i)invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs
-            if ($resp -match '(?i)invalid command|invalid scope|unrecognized') {
-                $rejected = $true
-                break
-            }
-        }
-        if ($rejected -or $resp -notmatch '(?i)/(device-connector|cloud)\s*#') { continue }
-
-        $detail = ''
-        try {
-            $detail = Send-Command -Port $Port -Command 'show detail' `
-                -ExpectPatterns @('#\s*$') -TimeoutSec 15 -InterDelayMs $delayMs
-        }
-        catch {
-            Write-Log -Level WARN "Device Connector 'show detail' did not return: $($_.Exception.Message)"
-            Restore-CimcCli -Port $Port | Out-Null
-            continue
-        }
-        if ($detail -match '(?i)Enabled\s*:\s*yes') {
-            Write-Log 'Device Connector is already enabled.'
-            Send-Command -Port $Port -Command 'top' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-            return
-        }
-        if ($detail -match '(?i)Update Stage|DC FW Version') {
-            Write-Log "Scope '$(($path -join ' / '))' updates connector firmware. Leaving it without commit."
-            continue
-        }
-
-        $enable = ''
-        try {
-            $enable = Send-CimcConfirm -Port $Port -Command 'set enabled yes' -TimeoutSec 15 -InterDelayMs $delayMs
-        }
-        catch {
-            Write-Log -Level WARN "Device Connector 'set enabled' did not return: $($_.Exception.Message)"
-            Restore-CimcCli -Port $Port | Out-Null
-            continue
-        }
-        if ($enable -match '(?i)invalid command|unrecognized') {
-            Write-Log "Scope '$(($path -join ' / '))' rejected 'set enabled'. Leaving it without commit."
-            continue
-        }
-        if ($enable -notmatch '\*#') {
-            Write-Log 'Device Connector set did not stage a change. Not committing.'
-            continue
-        }
-        $configured = $true
-        Send-CimcBestEffort -Port $Port -Command 'set read-only-mode no'        -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-        Send-CimcBestEffort -Port $Port -Command 'set tunneled-kvm-enabled yes' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-        Send-CimcBestEffort -Port $Port -Command 'set auto-update-enabled yes'  -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-        if ($Config.intersight.proxyHost) {
-            Send-CimcBestEffort -Port $Port -Command 'set proxy-enabled yes' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-            Send-CimcBestEffort -Port $Port -Command ("set proxy-host {0}" -f $Config.intersight.proxyHost) -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-            if ($Config.intersight.proxyPort) {
-                Send-CimcBestEffort -Port $Port -Command ("set proxy-port {0}" -f [int]$Config.intersight.proxyPort) -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-            }
-        }
-        try {
-            Send-CimcConfirm -Port $Port -Command 'commit' -TimeoutSec 30 -InterDelayMs $delayMs | Out-Null
-        }
-        catch {
-            Write-Log -Level WARN "Device Connector commit did not confirm: $($_.Exception.Message)"
-        }
-        break
-    }
-    if (-not $configured) {
-        Write-Log -Level WARN 'Could not enable the Device Connector from the CLI on this firmware. Enable it in the CIMC UI (Admin > Device Connector) before claiming in Intersight.'
-        Send-Command -Port $Port -Command 'top' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-        return
-    }
-
-    # Report the resulting state so the operator knows whether the Device
-    # Connector still needs enabling by hand before claiming in Intersight.
-    $state = Send-CimcBestEffort -Port $Port -Command 'show detail' -TimeoutSec $cmdTO -InterDelayMs $delayMs
-    if ($state -match '(?i)Enabled\s*:\s*yes') {
-        Write-Log 'Intersight Device Connector reports Enabled: yes.'
-    }
-    else {
-        Write-Log -Level WARN 'Could not confirm the Device Connector is enabled. Check Admin > Device Connector in the CIMC UI before claiming in Intersight.'
     }
 }
 
@@ -1894,8 +1780,8 @@ function Set-CimcPrecisionBootDevice {
 
 function Set-CimcVmediaBootOrder {
     # Precision boot order, applied in one rearrange so the list stays put:
-    #   1. KVM mapped DVD
-    #   2. CIMC mapped vDVD
+    #   1. CIMC mapped vDVD (the HUU ISO)
+    #   2. KVM mapped DVD
     #   3. local boot drive
     #   4. any other configured devices
     #   5. UEFI shell
@@ -1930,7 +1816,7 @@ function Set-CimcVmediaBootOrder {
 
     $listed = Send-Command -Port $Port -Command 'show boot-device' -ExpectPatterns @('#\s*$') -TimeoutSec $cmdTO -InterDelayMs $delayMs
     $known = @(Get-CimcBootDeviceNames -Text $listed)
-    $preferred = @($kvmName, $dvdName, $lunName)
+    $preferred = @($dvdName, $kvmName, $lunName)
     $ordered = @()
     foreach ($name in ($preferred + $known)) {
         if ($name -and $name -ne $shellName -and $ordered -notcontains $name) { $ordered += $name }
@@ -2125,7 +2011,6 @@ function New-CimcHuuTriggerBody {
         [Parameter(Mandatory)][string]$Cookie,
         [Parameter(Mandatory)][string]$RemoteIp,
         [Parameter(Mandatory)][string]$RemoteShare,
-        [string]$RemoteFile,
         [string]$ShareUser,
         [string]$SharePass,
         [Parameter(Mandatory)][string]$Component,
@@ -2136,15 +2021,14 @@ function New-CimcHuuTriggerBody {
     $xmlUser = ConvertTo-CimcXmlValue $ShareUser
     $xmlPass = ConvertTo-CimcXmlValue $SharePass
     # 6.0 accepts updateType, doForceDown, gracefulTimeout, and bootMedium,
-    # and puts the ISO name in remoteShare. 4.3 keeps remoteFile separate.
+    # and puts the ISO name in remoteShare. 4.3 rejects a remoteFile attribute
+    # on this object. The ISO name goes on the vMedia map instead.
     $newer = ''
-    $fileAttr = ''
     if (-not $Legacy) { $newer = ' updateType="immediate" doForceDown="yes" gracefulTimeout="3" bootMedium="vmedia"' }
-    if ($RemoteFile) { $fileAttr = " remoteFile=`"$(ConvertTo-CimcXmlValue $RemoteFile)`"" }
     return @"
 <configConfMo cookie="$safeCookie" dn="sys/huu/firmwareUpdater" inHierarchical="false">
   <inConfig>
-    <huuFirmwareUpdater dn="sys/huu/firmwareUpdater" adminState="trigger" mapType="www" remoteIp="$(ConvertTo-CimcXmlValue $RemoteIp)" remoteShare="$(ConvertTo-CimcXmlValue $RemoteShare)"$fileAttr username="$xmlUser" password="$xmlPass" updateComponent="$(ConvertTo-CimcXmlValue $Component)" stopOnError="no" timeOut="$TimeoutMin" verifyUpdate="no"$newer status="modified"/>
+    <huuFirmwareUpdater dn="sys/huu/firmwareUpdater" adminState="trigger" mapType="www" remoteIp="$(ConvertTo-CimcXmlValue $RemoteIp)" remoteShare="$(ConvertTo-CimcXmlValue $RemoteShare)" username="$xmlUser" password="$xmlPass" updateComponent="$(ConvertTo-CimcXmlValue $Component)" stopOnError="no" timeOut="$TimeoutMin" verifyUpdate="no"$newer status="modified"/>
   </inConfig>
 </configConfMo>
 "@
@@ -2206,6 +2090,195 @@ function Set-CimcWwwVolume {
     }
     Write-Log -Level WARN "vMedia volume '$Volume' did not reach OK."
     return $false
+}
+
+function Remove-CimcWwwVolume {
+    # Drop a vMedia volume over HTTPS. A dead serial console cannot unmap it,
+    # and a volume left in place makes the HUU job return ISO Mapping Error.
+    param(
+        [Parameter(Mandatory)][string]$CimcIp,
+        [Parameter(Mandatory)][string]$Volume
+    )
+    $cookie = Connect-CimcXml -CimcIp $CimcIp
+    $safeCookie = ConvertTo-CimcXmlValue $cookie
+    $dn = "sys/svc-ext/vmedia-svc/vmmap-$Volume"
+    $safeDn = ConvertTo-CimcXmlValue $dn
+    $delete = @"
+<configConfMo cookie="$safeCookie" dn="$safeDn" inHierarchical="false">
+  <inConfig>
+    <commVMediaMap dn="$safeDn" status="deleted"/>
+  </inConfig>
+</configConfMo>
+"@
+    $removed = Send-CimcXmlRequest -CimcIp $CimcIp -Body $delete -TimeoutSec 60
+    if ($removed -match 'errorCode="([^"]+)"' -and $Matches[1]) {
+        $why = ([regex]::Match($removed, 'errorDescr="([^"]*)"')).Groups[1].Value
+        if ($why -match '(?i)exist|found|absent|none') {
+            Write-Log "No vMedia volume '$Volume' was mapped."
+        }
+        else {
+            Write-Log -Level WARN "Could not remove vMedia volume '$Volume': $why"
+        }
+        return
+    }
+    Write-Log "Removed vMedia volume '$Volume' so the HUU job can mount the ISO."
+}
+
+function Set-CimcBootDeviceXml {
+    param(
+        [Parameter(Mandatory)][string]$CimcIp,
+        [Parameter(Mandatory)][string]$Cookie,
+        [Parameter(Mandatory)][string]$ClassName,
+        [Parameter(Mandatory)][string]$Dn,
+        [Parameter(Mandatory)][int]$Order,
+        [string]$Name,
+        [string]$Type,
+        [string]$Subtype,
+        [string]$State,
+        [string]$Status = 'modified'
+    )
+    $safeCookie = ConvertTo-CimcXmlValue $Cookie
+    $safeDn = ConvertTo-CimcXmlValue $Dn
+    $extra = ''
+    if ($Status -eq 'created') {
+        $extra = " name=`"$(ConvertTo-CimcXmlValue $Name)`" type=`"$(ConvertTo-CimcXmlValue $Type)`""
+        if ($Subtype) { $extra += " subtype=`"$(ConvertTo-CimcXmlValue $Subtype)`"" }
+    }
+    $stateAttr = ''
+    if ($State) { $stateAttr = " state=`"$(ConvertTo-CimcXmlValue $State)`"" }
+    $body = @"
+<configConfMo cookie="$safeCookie" dn="$safeDn" inHierarchical="false">
+  <inConfig>
+    <$ClassName dn="$safeDn"$extra order="$Order"$stateAttr status="$Status"/>
+  </inConfig>
+</configConfMo>
+"@
+    $resp = Send-CimcXmlRequest -CimcIp $CimcIp -Body $body -TimeoutSec 60
+    if ($resp -match 'errorCode="([^"]+)"' -and $Matches[1]) {
+        $why = ([regex]::Match($resp, 'errorDescr="([^"]*)"')).Groups[1].Value
+        return $why
+    }
+    return ''
+}
+
+function Set-CimcMappedDvdBoot {
+    # Put the CIMC-mapped DVD first so the host boots the mapped HUU ISO.
+    # Each device is its own request. CIMC rejects a parent and child in one.
+    param(
+        [Parameter(Mandatory)][string]$CimcIp,
+        [Parameter(Mandatory)][object]$Fw
+    )
+    $dvdName = if ($Fw.dvdBootName) { [string]$Fw.dvdBootName } else { 'vDVD' }
+    $kvmName = if ($Fw.kvmBootName) { [string]$Fw.kvmBootName } else { 'KvmDvd' }
+    $lunName = if ($Fw.localBootName) { [string]$Fw.localBootName } else { 'LocalLUN' }
+    $shellName = if ($Fw.uefiShellName) { [string]$Fw.uefiShellName } else { 'UefiShell' }
+    $cookie = Connect-CimcXml -CimcIp $CimcIp
+    $safeCookie = ConvertTo-CimcXmlValue $cookie
+    $query = "<configResolveDn cookie=`"$safeCookie`" dn=`"sys/rack-unit-1/boot-precision`" inHierarchical=`"true`"/>"
+    $text = Send-CimcXmlRequest -CimcIp $CimcIp -Body $query -TimeoutSec 60
+    if ($text -match 'errorCode="([^"]+)"' -and $Matches[1]) {
+        $why = ([regex]::Match($text, 'errorDescr="([^"]*)"')).Groups[1].Value
+        Write-Log -Level WARN "Could not read the precision boot order: $why"
+        return $false
+    }
+    $flat = $text -replace '\s+', ' '
+    $devices = @()
+    foreach ($tag in [regex]::Matches($flat, '<(lsboot[A-Za-z0-9]+)\s+([^>]*dn="[^"]+"[^>]*)/?>')) {
+        $attrs = @{}
+        foreach ($pair in [regex]::Matches($tag.Groups[2].Value, '([A-Za-z0-9_]+)="([^"]*)"')) {
+            $attrs[$pair.Groups[1].Value] = $pair.Groups[2].Value
+        }
+        if ($tag.Groups[1].Value -eq 'lsbootDevPrecision') { continue }
+        if (-not $attrs['dn'] -or -not $attrs['name']) { continue }
+        $devices += [pscustomobject]@{
+            Class   = $tag.Groups[1].Value
+            Name    = $attrs['name']
+            Dn      = $attrs['dn']
+            Type    = $attrs['type']
+            Subtype = $attrs['subtype']
+        }
+    }
+    $dvd = @($devices | Where-Object { $_.Subtype -match '(?i)cimc-mapped-dvd' -or $_.Name -eq $dvdName } | Select-Object -First 1)
+    if ($dvd.Count -eq 0) {
+        $dn = "sys/rack-unit-1/boot-precision/vm-$dvdName"
+        Write-Log "Creating precision boot device '$dvdName' (CIMC-mapped DVD)."
+        $why = Set-CimcBootDeviceXml -CimcIp $CimcIp -Cookie $cookie -ClassName 'lsbootVMedia' -Dn $dn `
+            -Order 1 -Name $dvdName -Type 'VMEDIA' -Subtype 'cimc-mapped-dvd' -State 'Enabled' -Status 'created'
+        if ($why) {
+            Write-Log -Level WARN "Could not create boot device '$dvdName': $why"
+            return $false
+        }
+        $devices += [pscustomobject]@{ Class = 'lsbootVMedia'; Name = $dvdName; Dn = $dn; Type = 'VMEDIA'; Subtype = 'cimc-mapped-dvd' }
+        $dvd = @($devices | Where-Object { $_.Name -eq $dvdName } | Select-Object -First 1)
+    }
+    $kvm = @($devices | Where-Object { $_.Name -eq $kvmName -or $_.Subtype -match '(?i)kvm-mapped-dvd' } | Select-Object -First 1)
+    $lun = @($devices | Where-Object { $_.Name -eq $lunName -or $_.Type -match '(?i)^LOCALHDD$' } | Select-Object -First 1)
+    $shell = @($devices | Where-Object { $_.Name -eq $shellName -or $_.Class -eq 'lsbootUefiShell' } | Select-Object -First 1)
+    $ordered = @()
+    foreach ($item in @($dvd + $kvm + $lun)) {
+        if ($item -and $item.Dn -and (@($ordered | Where-Object { $_.Dn -eq $item.Dn }).Count -eq 0)) { $ordered += $item }
+    }
+    foreach ($item in $devices) {
+        if ($shell -and $item.Dn -eq $shell.Dn) { continue }
+        if ((@($ordered | Where-Object { $_.Dn -eq $item.Dn }).Count -eq 0)) { $ordered += $item }
+    }
+    if ($shell -and $shell.Dn) { $ordered += $shell }
+    $position = 1
+    foreach ($item in $ordered) {
+        $enable = ''
+        if ($item.Name -in @($dvdName, $kvmName, $lunName, $shellName) -or $item.Subtype -match '(?i)cimc-mapped-dvd|kvm-mapped-dvd') {
+            $enable = 'Enabled'
+        }
+        $why = Set-CimcBootDeviceXml -CimcIp $CimcIp -Cookie $cookie -ClassName $item.Class -Dn $item.Dn -Order $position -State $enable
+        if ($why) {
+            Write-Log -Level WARN "Could not set boot device '$($item.Name)' to order ${position}: $why"
+            if ($item.Name -eq $dvdName -or $item.Subtype -match '(?i)cimc-mapped-dvd') { return $false }
+        }
+        else {
+            Write-Log "Boot device '$($item.Name)' is order $position."
+        }
+        $position++
+    }
+    Write-Log "Precision boot order starts with the CIMC-mapped DVD '$dvdName'."
+    return $true
+}
+
+function Invoke-CimcHostPowerXml {
+    # Power-cycle the host over HTTPS. The serial console is not required.
+    param([Parameter(Mandatory)][string]$CimcIp)
+    $cookie = Connect-CimcXml -CimcIp $CimcIp
+    $safeCookie = ConvertTo-CimcXmlValue $cookie
+    Write-Log 'Power-cycling the host over HTTPS so it boots the mapped HUU ISO.'
+    $body = @"
+<configConfMo cookie="$safeCookie" dn="sys/rack-unit-1" inHierarchical="false">
+  <inConfig>
+    <computeRackUnit dn="sys/rack-unit-1" adminPower="cycle-immediate" status="modified"/>
+  </inConfig>
+</configConfMo>
+"@
+    $resp = Send-CimcXmlRequest -CimcIp $CimcIp -Body $body -TimeoutSec 90
+    if ($resp -match 'errorCode="([^"]+)"' -and $Matches[1]) {
+        $why = ([regex]::Match($resp, 'errorDescr="([^"]*)"')).Groups[1].Value
+        if ($why -match '(?i)powered off|is off|not powered') {
+            Write-Log 'CIMC reports the host is off. Powering it on over HTTPS.'
+            $on = @"
+<configConfMo cookie="$safeCookie" dn="sys/rack-unit-1" inHierarchical="false">
+  <inConfig>
+    <computeRackUnit dn="sys/rack-unit-1" adminPower="up" status="modified"/>
+  </inConfig>
+</configConfMo>
+"@
+            $resp = Send-CimcXmlRequest -CimcIp $CimcIp -Body $on -TimeoutSec 90
+            if ($resp -notmatch 'errorCode="') {
+                Write-Log 'Host power-on was accepted.'
+                return $true
+            }
+        }
+        Write-Log -Level WARN "CIMC rejected the power cycle: $why"
+        return $false
+    }
+    Write-Log 'Host power-cycle was accepted. The server is booting the mapped ISO.'
+    return $true
 }
 
 function Invoke-CimcHuuUpgrade {
@@ -2313,29 +2386,8 @@ function Invoke-CimcHuuUpgrade {
             }
             if ($failed.Count -gt 0 -or $overall -match '(?i)\b(fail|error)\b') {
                 $which = if ($failed.Count -gt 0) { $failed -join ', ' } else { $overall }
-                if ($overall -match '(?i)ISO Mapping Error' -and $mapAttempt -lt 1 -and $ShareDir -and $RemoteFile) {
-                    $mapAttempt++
-                    $retryPolls = 0
-                    $oldEnd = $end
-                    $oldStart = $start
-                    $oldOverall = $overall
-                    $seenActive = $false
-                    $lastSummary = ''
-                    if (-not $cookie) { $cookie = Connect-CimcXml -CimcIp $CimcIp }
-                    $retryIp = if ($MapRetryIp) { $MapRetryIp } else { $RemoteIp }
-                    Write-Log "CIMC reported ISO Mapping Error for the combined 6.0 location. Retrying with remote share '$ShareDir' and remote file '$RemoteFile'."
-                    $body = New-CimcHuuTriggerBody -Cookie $cookie -RemoteIp $retryIp -RemoteShare $ShareDir -RemoteFile $RemoteFile `
-                        -ShareUser $ShareUser -SharePass $SharePass -Component $component -TimeoutMin $timeoutMin -Legacy
-                    $trigger = Send-CimcXmlRequest -CimcIp $CimcIp -Body $body -TimeoutSec 180
-                    if ($trigger -match 'errorCode="([^"]+)"' -and $Matches[1]) {
-                        $why = ([regex]::Match($trigger, 'errorDescr="([^"]*)"')).Groups[1].Value
-                        if (-not $why) { $why = 'CIMC rejected the split HUU fields.' }
-                        throw "ISO Mapping Error: $why"
-                    }
-                    continue
-                }
                 if ($overall -match '(?i)ISO Mapping Error') {
-                    throw "HUU finished with failures: $which. CIMC never opened the ISO URL. Confirm the CIMC management IP can reach the laptop address and port in that URL."
+                    throw "HUU finished with failures: $which. The HUU job could not mount the ISO. The remote share and remote file will be mapped, then the host will boot that virtual DVD."
                 }
                 throw "HUU finished with failures: $which"
             }
@@ -2577,9 +2629,11 @@ function Invoke-FirmwareUpgrade {
         $upgraded = $false
         $script:HuuJobStarted = $false
         $huuError = $null
-        # HUU mounts the ISO itself. A volume left from an earlier run can hold
-        # the CIMC-mapped DVD slot and stop that mount. Recover the prompt
-        # first: a Device Connector commit on 4.3 can leave the CLI silent.
+        # HUU mounts the ISO itself. A volume left from an earlier run makes
+        # that job return ISO Mapping Error. Clear it over HTTPS first. The
+        # serial unmap is a second attempt when the console is answering.
+        try { Remove-CimcWwwVolume -CimcIp $TargetIp -Volume $volume }
+        catch { Write-Log -Level WARN "Could not remove an earlier ISO mapping over HTTPS: $($_.Exception.Message)" }
         if (-not (Restore-CimcCli -Port $SerialPort)) {
             Write-Log -Level WARN 'The serial console did not return a prompt before the ISO unmap.'
         }
@@ -2610,12 +2664,14 @@ function Invoke-FirmwareUpgrade {
             throw $huuError
         }
         else {
-            # 4.3 accepts the HUU job and then fails the mount before it opens
-            # the URL. map-www is the mount that carries the port. A browser on
-            # this laptop can download the ISO even when CIMC never connects.
+            # 4.3 keeps the remote share and remote file on the vMedia map.
+            # The HUU object cannot take remoteFile. Once the volume is mapped,
+            # boot order and the power cycle go over HTTPS so a dead serial
+            # console does not leave the host on its disk.
             $xmlMapped = $false
+            $bootOrderSet = $false
             if ($huuError -match '(?i)ISO Mapping Error') {
-                Write-Log '4.3 keeps remote share and remote file separate. A browser on this laptop can open the URL even when CIMC has not connected.'
+                Write-Log '4.3 keeps remote share and remote file separate. Mapping that volume, then booting the CIMC-mapped DVD.'
                 try {
                     $xmlMapped = Set-CimcWwwVolume -CimcIp $TargetIp -Volume $volume -ShareDir $share.ShareDir -IsoFile $isoFile `
                         -User ([string]$fw.shareUser) -Pass ([string]$fw.sharePassword)
@@ -2626,6 +2682,22 @@ function Invoke-FirmwareUpgrade {
                 if ($xmlMapped -and $script:HttpLogState -and [string]$script:HttpLogState.Seen -notlike "*|$TargetIp|*") {
                     Write-Log -Level WARN "The vMedia map is saved, but CIMC has not requested the ISO yet. A download from this laptop does not show that CIMC can reach the HTTP port."
                 }
+                if ($xmlMapped) {
+                    try { $bootOrderSet = [bool](Set-CimcMappedDvdBoot -CimcIp $TargetIp -Fw $fw) }
+                    catch {
+                        Write-Log -Level WARN "Could not set the boot order over HTTPS: $($_.Exception.Message)"
+                        $bootOrderSet = $false
+                    }
+                    if ($bootOrderSet -and $powerCyc) {
+                        try {
+                            if (-not (Invoke-CimcHostPowerXml -CimcIp $TargetIp)) { $bootOrderSet = $false }
+                        }
+                        catch {
+                            Write-Log -Level WARN "Could not power-cycle the host over HTTPS: $($_.Exception.Message)"
+                            $bootOrderSet = $false
+                        }
+                    }
+                }
             }
             if (-not $xmlMapped) {
                 if ($huuError -match '(?i)ISO Mapping Error' -and -not (Restore-CimcCli -Port $SerialPort)) {
@@ -2634,23 +2706,25 @@ function Invoke-FirmwareUpgrade {
                 Set-CimcVmediaMap -Port $SerialPort -Config $Config -Volume $volume -BaseUrl $baseUrl -IsoFile $isoFile `
                     -User ([string]$fw.shareUser) -Pass ([string]$fw.sharePassword) | Out-Null
             }
-            $bootOrderSet = $false
-            try {
-                if (-not (Sync-CimcPrompt -Port $SerialPort -Attempts 3 -TimeoutSec 5)) {
-                    throw "The serial console did not return a prompt after the ISO was mapped."
+            if (-not $bootOrderSet) {
+                try {
+                    if (-not (Sync-CimcPrompt -Port $SerialPort -Attempts 3 -TimeoutSec 5)) {
+                        throw "The serial console did not return a prompt after the ISO was mapped."
+                    }
+                    Set-CimcVmediaBootOrder -Port $SerialPort -Config $Config -Fw $fw
+                    if ($powerCyc) { Invoke-CimcPowerCycle -Port $SerialPort -Config $Config }
+                    $bootOrderSet = $true
                 }
-                Set-CimcVmediaBootOrder -Port $SerialPort -Config $Config -Fw $fw
-                if ($powerCyc) { Invoke-CimcPowerCycle -Port $SerialPort -Config $Config }
-                $bootOrderSet = $true
-            }
-            catch {
-                Write-Log -Level WARN "ISO is mapped, but the boot order was not changed: $($_.Exception.Message)"
+                catch {
+                    Write-Log -Level WARN "ISO is mapped, but the boot order was not changed: $($_.Exception.Message)"
+                }
             }
             if ($server) {
                 Write-Host ''
                 if ($bootOrderSet) {
-                    Write-Host "Automatic HUU did not start. The ISO is mapped and the server is booting to it." -ForegroundColor Yellow
+                    Write-Host "The ISO is mapped, the CIMC-mapped DVD is first, and the host is power-cycling into HUU." -ForegroundColor Yellow
                     Write-Host "In the HUU screen, choose Update and Activate for all components except the drives." -ForegroundColor Yellow
+                    Write-Host "Do not press Enter until that update finishes. Enter stops the ISO server." -ForegroundColor Yellow
                 } else {
                     Write-Host "Automatic HUU did not start, and the serial console stopped answering." -ForegroundColor Yellow
                     Write-Host "In CIMC, boot the mapped vDVD, then choose Update and Activate for all components." -ForegroundColor Yellow
@@ -2712,14 +2786,6 @@ function Invoke-ConfigureServer {
                                    -PrimaryDns $dns1 -SecondaryDns $dns2 -DnsDomain $domain
         Start-Sleep -Seconds 3
         Set-CimcNtp                -Port $script:Port -Config $Config -NtpServers $ntp
-        # Everything above is already committed, so a hiccup here must not fail
-        # the whole run. Report it and continue to the firmware step / logout.
-        try {
-            Enable-IntersightDeviceConnector -Port $script:Port -Config $Config
-        }
-        catch {
-            Write-Log -Level WARN "Intersight Device Connector step did not complete: $($_.Exception.Message). All other configuration was committed; enable it from Admin > Device Connector if needed."
-        }
         if ($script:FirmwareEnabled) {
             Write-Log 'Firmware step enabled: running the HUU update.'
             Invoke-FirmwareUpgrade -SerialPort $script:Port -Config $Config -TargetIp $ip

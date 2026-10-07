@@ -33,17 +33,6 @@
     },
 
 
-    // -------- Intersight readiness -------------------------------------------
-    "intersight": {
-        // true enables the Device Connector so the server can be claimed in Intersight.
-        "enableDeviceConnector": true,
-
-        // Set both only if CIMC must use a proxy to reach Intersight.
-        "proxyHost":             null,
-        "proxyPort":             null
-    },
-
-
     // The admin password is not stored here. The script prompts for the current
     // password at startup. It asks for a new one only when CIMC is still at the
     // factory default and forces a change.
@@ -92,7 +81,7 @@
         "sharePassword":  null,
 
         // Boot-device names. Used only if the automatic HUU job cannot start:
-        // KVM DVD, CIMC vDVD, boot drive, then UEFI shell.
+        // CIMC vDVD first, then KVM DVD, boot drive, and UEFI shell.
         "vmediaVolume":   "firmware",
         "kvmBootName":    "KvmDvd",
         "kvmSubtype":     "KVMMAPPEDDVD",
