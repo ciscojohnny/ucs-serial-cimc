@@ -8,13 +8,12 @@
 
     Order of operations:
         1. Log in. Change the admin password only if CIMC is still at factory default.
-        2. Enable UEFI secure boot (takes effect on the next host reboot).
-        3. Set NIC mode, static IPv4, DNS, hostname, and DNS domain.
-        4. Enable NTP, load the NTP servers, and set the timezone.
-        5. Enable the Intersight Device Connector.
-        6. If firmware.enabled is true (or -Firmware is passed), serve the HUU
-           ISO and have CIMC update and activate every component. That boot
-           applies secure boot. Otherwise reboot the host at the end.
+        2. Set NIC mode, static IPv4, DNS, hostname, and DNS domain.
+        3. Enable NTP, load the NTP servers, and set the timezone.
+        4. Enable the Intersight Device Connector.
+        5. If firmware.enabled is true (or -Firmware is passed), serve the HUU
+           ISO and have CIMC update and activate every component. CIMC boots
+           the ISO as part of that job.
 
 .NOTES
     Tested against CIMC 4.x / 5.x CLI (UCS C220/C240 M5/M6/M7).
@@ -1663,39 +1662,6 @@ function Set-CimcPrecisionBootDevice {
     Send-Command -Port $Port -Command 'exit' -ExpectPatterns @('#\s*$') -TimeoutSec $TimeoutSec -InterDelayMs $InterDelayMs | Out-Null
 }
 
-function Enable-CimcUefiSecureBoot {
-    # scope bios / set secure-boot enable / commit. Enabling it also forces UEFI
-    # mode. The change is applied on the next host reboot.
-    param(
-        [Parameter(Mandatory)][System.IO.Ports.SerialPort]$Port,
-        [Parameter(Mandatory)][object]$Config
-    )
-    $cmdTO   = [int]$Config.behavior.commandTimeoutSec
-    $delayMs = [int]$Config.behavior.interCommandDelayMs
-
-    Write-Log 'Enabling UEFI secure boot.'
-    Send-Command -Port $Port -Command 'top' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-    Send-Command -Port $Port -Command 'scope bios' -ExpectPatterns @('#\s*$','Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-    $secure = Send-Command -Port $Port -Command 'set secure-boot enable' `
-        -ExpectPatterns @('#\s*$', '(?i)invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs
-    if ($secure -match '(?i)invalid') {
-        Write-Log -Level WARN "This CIMC rejected 'set secure-boot enable'."
-        return
-    }
-    Send-CimcConfirm -Port $Port -Command 'commit' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-    $detail = Send-Command -Port $Port -Command 'show detail' -ExpectPatterns @('#\s*$') -TimeoutSec $cmdTO -InterDelayMs $delayMs
-    if ($detail -match '(?i)UEFI Secure Boot:\s*enabled') {
-        Write-Log 'UEFI secure boot is enabled.'
-    }
-    elseif ($detail -match '(?i)UEFI Secure Boot:\s*disabled') {
-        Write-Log -Level WARN 'UEFI secure boot is still reported disabled after the commit.'
-    }
-    else {
-        Write-Log 'UEFI secure boot enable was committed.'
-    }
-    Send-Command -Port $Port -Command 'top' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-}
-
 function Set-CimcVmediaBootOrder {
     # Precision boot order, applied in one rearrange so the list stays put:
     #   1. KVM mapped DVD
@@ -1703,8 +1669,7 @@ function Set-CimcVmediaBootOrder {
     #   3. local boot drive
     #   4. any other configured devices
     #   5. UEFI shell
-    # Used only when the automatic HUU job cannot be started. Secure boot is
-    # already set at the start of the run; this confirms it again.
+    # Used only when the automatic HUU job cannot be started.
     param(
         [Parameter(Mandatory)][System.IO.Ports.SerialPort]$Port,
         [Parameter(Mandatory)][object]$Config,
@@ -1753,9 +1718,6 @@ function Set-CimcVmediaBootOrder {
         Write-Log -Level WARN "rearrange-boot-device was rejected. The individual device order was not used, because CIMC does not keep that order."
     }
 
-    Enable-CimcUefiSecureBoot -Port $Port -Config $Config
-
-    Send-Command -Port $Port -Command 'scope bios' -ExpectPatterns @('#\s*$','Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
     $final = Send-Command -Port $Port -Command 'show boot-device' -ExpectPatterns @('#\s*$') -TimeoutSec $cmdTO -InterDelayMs $delayMs
     Write-Log "Configured precision boot order:`n$final"
 }
@@ -1932,8 +1894,6 @@ function Invoke-CimcHuuUpgrade {
     $timeoutMin = if ($Fw.updateTimeoutMin) { [int]$Fw.updateTimeoutMin } else { 240 }
     if ($timeoutMin -lt 30) { $timeoutMin = 30 }
     if ($timeoutMin -gt 240) { $timeoutMin = 240 }
-    $secure = 'yes'
-    if ($Fw.PSObject.Properties.Name -contains 'cimcSecureBoot' -and -not [bool]$Fw.cimcSecureBoot) { $secure = 'no' }
 
     Write-Log "Signing in to CIMC at https://$CimcIp/ to start the HUU update."
     $script:HuuJobStarted = $false
@@ -1949,7 +1909,7 @@ function Invoke-CimcHuuUpgrade {
     $body = @"
 <configConfMo cookie="$safeCookie" dn="sys/huu/firmwareUpdater" inHierarchical="false">
   <inConfig>
-    <huuFirmwareUpdater dn="sys/huu/firmwareUpdater" adminState="trigger" mapType="www" remoteIp="$(ConvertTo-CimcXmlValue $RemoteIp)" remoteShare="$(ConvertTo-CimcXmlValue $RemoteShare)" username="$xmlUser" password="$xmlPass" updateComponent="$(ConvertTo-CimcXmlValue $component)" stopOnError="no" timeOut="$timeoutMin" verifyUpdate="no" cimcSecureBoot="$secure" updateType="immediate" doForceDown="yes" gracefulTimeout="3" bootMedium="vmedia" status="modified"/>
+    <huuFirmwareUpdater dn="sys/huu/firmwareUpdater" adminState="trigger" mapType="www" remoteIp="$(ConvertTo-CimcXmlValue $RemoteIp)" remoteShare="$(ConvertTo-CimcXmlValue $RemoteShare)" username="$xmlUser" password="$xmlPass" updateComponent="$(ConvertTo-CimcXmlValue $component)" stopOnError="no" timeOut="$timeoutMin" verifyUpdate="no" updateType="immediate" doForceDown="yes" gracefulTimeout="3" bootMedium="vmedia" status="modified"/>
   </inConfig>
 </configConfMo>
 "@
@@ -2085,9 +2045,8 @@ function Remove-CimcVmediaMap {
 }
 
 function Invoke-CimcHostReboot {
-    # Reboot the host so the BIOS settings (secure boot, boot order) take
-    # effect. A host that is off is powered on instead, because 'power cycle'
-    # is refused on a powered-off host.
+    # Power-cycle the host, or power it on if it is already off. Used to boot
+    # the HUU ISO. 'power cycle' is refused on a powered-off host.
     param(
         [Parameter(Mandatory)][System.IO.Ports.SerialPort]$Port,
         [Parameter(Mandatory)][object]$Config,
@@ -2359,7 +2318,6 @@ function Invoke-ConfigureServer {
     try {
         $script:Port = Open-CimcSerial -PortName $ComPort -Serial $Config.serial
         Invoke-CimcLogin           -Port $script:Port -Behavior $Config.behavior
-        Enable-CimcUefiSecureBoot  -Port $script:Port -Config $Config
         Set-CimcNetwork            -Port $script:Port -Config $Config -Ip $ip -Hostname $hn `
                                    -PrimaryDns $dns1 -SecondaryDns $dns2 -DnsDomain $domain
         Start-Sleep -Seconds 3
@@ -2372,29 +2330,9 @@ function Invoke-ConfigureServer {
         catch {
             Write-Log -Level WARN "Intersight Device Connector step did not complete: $($_.Exception.Message). All other configuration was committed; enable it from Admin > Device Connector if needed."
         }
-        # Last step reboots the host so the BIOS settings take effect. With the
-        # firmware step on, the HUU boot is that reboot.
         if ($script:FirmwareEnabled) {
-            Write-Log 'Firmware step enabled: running the HUU update. The HUU boot applies the settings above.'
+            Write-Log 'Firmware step enabled: running the HUU update.'
             Invoke-FirmwareUpgrade -SerialPort $script:Port -Config $Config -TargetIp $ip
-        }
-        else {
-            $reboot = $true
-            if ($Config.behavior.PSObject.Properties.Name -contains 'rebootWhenDone') { $reboot = [bool]$Config.behavior.rebootWhenDone }
-            if ($reboot) {
-                try {
-                    if (-not (Sync-CimcPrompt -Port $script:Port -Attempts 3 -TimeoutSec 5)) {
-                        throw 'The serial console did not return a prompt.'
-                    }
-                    Invoke-CimcHostReboot -Port $script:Port -Config $Config -Reason 'apply UEFI secure boot'
-                }
-                catch {
-                    Write-Log -Level WARN "Configuration is committed, but the host was not rebooted: $($_.Exception.Message). Reboot it from the CIMC UI so UEFI secure boot takes effect."
-                }
-            }
-            else {
-                Write-Log 'behavior.rebootWhenDone is false. Reboot the host later so UEFI secure boot takes effect.'
-            }
         }
         Invoke-CimcLogout          -Port $script:Port
         Write-Log "===== Finished configuration for $hn ($ip) ====="

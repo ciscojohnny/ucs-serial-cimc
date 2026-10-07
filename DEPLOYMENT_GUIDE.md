@@ -48,11 +48,10 @@ You'll do that by:
    for you — including the mandatory first-login password change on a
    factory-default CIMC.
 
-When the script finishes, the CIMC is reachable on its new IP address and UEFI
-secure boot is enabled. The host reboots at the end so that takes effect. You
-then open the CIMC web UI and copy the Device ID and Claim Code to register the
-server with Intersight. If the firmware step is on, the Host Upgrade Utility
-boot is that reboot, and the script waits until the upgrade finishes.
+When the script finishes, the CIMC is reachable on its new IP address. You then
+open the CIMC web UI and copy the Device ID and Claim Code to register the
+server with Intersight. If the firmware step is on, the script waits until the
+Host Upgrade Utility finishes. CIMC boots that ISO as part of the upgrade.
 
 ---
 
@@ -295,13 +294,9 @@ Timeouts. The defaults are fine for most environments.
 "behavior": {
     "commandTimeoutSec":   20,
     "loginTimeoutSec":     60,
-    "interCommandDelayMs": 250,
-    "rebootWhenDone":      true    // reboot at the end so secure boot takes effect
+    "interCommandDelayMs": 250
 }
 ```
-
-`rebootWhenDone` is ignored when the firmware step runs. The HUU boot is the
-reboot in that case. Set it to `false` only if you will reboot the host yourself.
 
 #### 5e. The `"servers"` list — one entry per server
 
@@ -447,8 +442,8 @@ logs back in with the new password to finish the configuration.
 
 Lines starting with `->` are commands the script sent to CIMC; password lines
 show `<redacted>`. A configuration run on an already-booted CIMC finishes
-within a few minutes, then reboots the host. A firmware run stays open for the
-whole upgrade, often one to three hours. Either way it ends with something like:
+within a few minutes. A firmware run stays open for the whole upgrade, often
+one to three hours. Either way it ends with something like:
 
 ```
 Done. Log: .../logs/cimc-session-20260610-102651.log
@@ -486,9 +481,8 @@ included the firmware step, wait until that job finishes before you unplug.
 With the firmware step on, the script serves a Cisco Host Upgrade Utility ISO
 and tells CIMC to update and activate every component in it, including drives.
 CIMC boots the ISO itself. You do not drive the HUU screen. Leave the script
-window open until the log says the job finished. That boot applies the UEFI
-secure boot setting from earlier in the run, so the script does not reboot
-again at the end.
+window open until the log says the job finished. A configuration-only run does
+not reboot the host.
 
 If CIMC rejects the automatic job, the script maps the ISO, sets the boot order
 (KVM DVD, CIMC vDVD, boot drive, UEFI shell), and power-cycles. Finish
@@ -538,8 +532,7 @@ Put the ISO in a folder on your laptop, then edit the `"firmware"` block in
     "shareUser":         null,
     "sharePassword":     null,
     "updateComponent":   "all,hdd",      // "all" skips drives
-    "updateTimeoutMin":  240,
-    "cimcSecureBoot":    true
+    "updateTimeoutMin":  240
 }
 ```
 
@@ -662,5 +655,3 @@ start over.
   notes to.
 - **HUU** — Host Upgrade Utility. The Cisco ISO that updates and activates
   server firmware.
-- **UEFI secure boot** — a BIOS setting that only boots signed software. The
-  script turns it on at the start. It applies on the next reboot.

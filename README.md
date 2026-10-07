@@ -1,10 +1,9 @@
 # UCS C-Series CIMC Configuration (Serial)
 
 PowerShell script that drives the CIMC CLI over the serial console. It sets
-UEFI secure boot, networking, DNS, NTP, hostname, and the Intersight Device
-Connector. With the firmware step off, it reboots the host at the end so secure
-boot takes effect. With the firmware step on, it serves a Host Upgrade Utility
-ISO and has CIMC update and activate every component. That boot is the reboot.
+networking, DNS, NTP, hostname, and the Intersight Device Connector. With the
+firmware step on, it serves a Host Upgrade Utility ISO and has CIMC update and
+activate every component. CIMC boots that ISO as part of the upgrade.
 
 The script configures **one server at a time** over a single serial port. All
 editable values live in a single **JSONC** file (`cimc-config.jsonc`). JSONC is
@@ -29,21 +28,18 @@ JSON plus comments — open it in Notepad, VS Code, or any text editor.
 In this order:
 
 1. Log in. On a factory-default CIMC, complete the forced password change.
-2. Enable UEFI secure boot. This also selects UEFI mode and applies on the next reboot.
-3. Set NIC mode, static IPv4, DNS, hostname, and DNS domain. A hostname change
+2. Set NIC mode, static IPv4, DNS, hostname, and DNS domain. A hostname change
    regenerates the CIMC certificate. The script answers that prompt.
-4. Enable NTP, then load up to four NTP servers and the timezone.
-5. Enable the Intersight Device Connector, and a proxy if one is configured.
-6. Reboot the host so secure boot takes effect. If `firmware.enabled` is true,
-   or you pass `-Firmware`, skip that reboot and run the HUU upgrade instead.
+3. Enable NTP, then load up to four NTP servers and the timezone.
+4. Enable the Intersight Device Connector, and a proxy if one is configured.
+5. If `firmware.enabled` is true, or you pass `-Firmware`, run the HUU upgrade.
    CIMC mounts the ISO, updates and activates every component, then the script
    puts the boot drive first. If the automatic job cannot start, the script
    maps the ISO and boots it so you can choose Update and Activate on the HUU screen.
 
 `site.disableIpv6` turns IPv6 off on the management port. `site.vlanEnabled`
-tags that port. Set `behavior.rebootWhenDone` to `false` to skip the end reboot
-when you are not running the firmware step. Secure boot still will not apply
-until something reboots the host.
+tags that port. CIMC settings apply when they are committed, so the script does
+not reboot the host after a configuration-only run.
 
 The script **only changes the CIMC admin password** when the CIMC is still at
 its factory default and CIMC itself forces a change at first login. On a CIMC

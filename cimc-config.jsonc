@@ -63,11 +63,7 @@
     "behavior": {
         "commandTimeoutSec":   20,
         "loginTimeoutSec":     60,
-        "interCommandDelayMs": 250,
-
-        // Reboot the host at the end so secure boot takes effect.
-        // Ignored when the firmware step runs; the HUU boot is that reboot.
-        "rebootWhenDone":      true
+        "interCommandDelayMs": 250
     },
 
 
@@ -112,11 +108,8 @@
 
         // "all,hdd" updates and activates every component, including drives.
         // "all" skips drives. Timeout is 30 to 240 minutes.
-        // cimcSecureBoot installs the CIMC firmware in secure mode.
-        // Host UEFI secure boot is always enabled earlier in the run.
         "updateComponent":  "all,hdd",
-        "updateTimeoutMin": 240,
-        "cimcSecureBoot":   true
+        "updateTimeoutMin": 240
     },
 
 
