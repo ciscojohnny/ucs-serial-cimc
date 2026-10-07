@@ -21,6 +21,7 @@
         - DNS domain                               (from JSON)
         - Up to 4 NTP servers + timezone           (from JSON)
         - Sets a new CIMC admin password ONLY if the factory default is detected
+        - Enables UEFI secure boot
         - Enables Intersight Device Connector
 
 .NOTES
@@ -1677,6 +1678,39 @@ function Set-CimcPrecisionBootDevice {
     Send-Command -Port $Port -Command 'exit' -ExpectPatterns @('#\s*$') -TimeoutSec $TimeoutSec -InterDelayMs $InterDelayMs | Out-Null
 }
 
+function Enable-CimcUefiSecureBoot {
+    # scope bios / set secure-boot enable / commit. Enabling it also forces UEFI
+    # mode. The change is applied on the next host reboot.
+    param(
+        [Parameter(Mandatory)][System.IO.Ports.SerialPort]$Port,
+        [Parameter(Mandatory)][object]$Config
+    )
+    $cmdTO   = [int]$Config.behavior.commandTimeoutSec
+    $delayMs = [int]$Config.behavior.interCommandDelayMs
+
+    Write-Log 'Enabling UEFI secure boot.'
+    Send-Command -Port $Port -Command 'top' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+    Send-Command -Port $Port -Command 'scope bios' -ExpectPatterns @('#\s*$','Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+    $secure = Send-Command -Port $Port -Command 'set secure-boot enable' `
+        -ExpectPatterns @('#\s*$', '(?i)invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs
+    if ($secure -match '(?i)invalid') {
+        Write-Log -Level WARN "This CIMC rejected 'set secure-boot enable'."
+        return
+    }
+    Send-CimcConfirm -Port $Port -Command 'commit' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+    $detail = Send-Command -Port $Port -Command 'show detail' -ExpectPatterns @('#\s*$') -TimeoutSec $cmdTO -InterDelayMs $delayMs
+    if ($detail -match '(?i)UEFI Secure Boot:\s*enabled') {
+        Write-Log 'UEFI secure boot is enabled.'
+    }
+    elseif ($detail -match '(?i)UEFI Secure Boot:\s*disabled') {
+        Write-Log -Level WARN 'UEFI secure boot is still reported disabled after the commit.'
+    }
+    else {
+        Write-Log 'UEFI secure boot enable was committed.'
+    }
+    Send-Command -Port $Port -Command 'top' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+}
+
 function Set-CimcVmediaBootOrder {
     # Precision boot order, applied in one rearrange so the list stays put:
     #   1. KVM mapped DVD
@@ -1733,15 +1767,9 @@ function Set-CimcVmediaBootOrder {
         Write-Log -Level WARN "rearrange-boot-device was rejected. The individual device order was not used, because CIMC does not keep that order."
     }
 
-    $secure = Send-Command -Port $Port -Command 'set secure-boot enable' `
-        -ExpectPatterns @('#\s*$', '(?i)invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs
-    if ($secure -match '(?i)invalid') {
-        Write-Log -Level WARN "This CIMC rejected 'set secure-boot enable'."
-    } else {
-        Send-CimcConfirm -Port $Port -Command 'commit' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-        Write-Log 'UEFI secure boot enable is committed.'
-    }
+    Enable-CimcUefiSecureBoot -Port $Port -Config $Config
 
+    Send-Command -Port $Port -Command 'scope bios' -ExpectPatterns @('#\s*$','Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
     $final = Send-Command -Port $Port -Command 'show boot-device' -ExpectPatterns @('#\s*$') -TimeoutSec $cmdTO -InterDelayMs $delayMs
     Write-Log "Configured precision boot order:`n$final"
 }
@@ -2271,6 +2299,7 @@ function Invoke-ConfigureServer {
     try {
         $script:Port = Open-CimcSerial -PortName $ComPort -Serial $Config.serial
         Invoke-CimcLogin           -Port $script:Port -Behavior $Config.behavior
+        Enable-CimcUefiSecureBoot  -Port $script:Port -Config $Config
         Set-CimcNetwork            -Port $script:Port -Config $Config -Ip $ip -Hostname $hn `
                                    -PrimaryDns $dns1 -SecondaryDns $dns2 -DnsDomain $domain
         Start-Sleep -Seconds 3
