@@ -1746,6 +1746,319 @@ function Set-CimcVmediaBootOrder {
     Write-Log "Configured precision boot order:`n$final"
 }
 
+function Initialize-CimcXmlTls {
+    # CIMC management HTTPS on 4.x/6.x answers TLS 1.2. TLS 1.3 is offered too
+    # when this Windows build has it. The appliance certificate is self-signed,
+    # so it is accepted for this process only and its properties are logged.
+    if ($script:CimcXmlTlsReady) { return }
+    $protocols = [System.Net.SecurityProtocolType]::Tls12
+    if ([enum]::GetNames([System.Net.SecurityProtocolType]) -contains 'Tls13') {
+        $protocols = $protocols -bor [System.Net.SecurityProtocolType]::Tls13
+    }
+    [System.Net.ServicePointManager]::SecurityProtocol = $protocols
+    [System.Net.ServicePointManager]::Expect100Continue = $false
+    $script:CimcCertNoted = $false
+    [System.Net.ServicePointManager]::ServerCertificateValidationCallback = {
+        param($sender, $certificate, $chain, $sslPolicyErrors)
+        if (-not $script:CimcCertNoted -and $certificate) {
+            $script:CimcCertNoted = $true
+            try {
+                $x509 = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 $certificate
+                $keyBits = ''
+                try { $keyBits = [string]$x509.PublicKey.Key.KeySize } catch { $keyBits = 'unknown' }
+                $sig = $x509.SignatureAlgorithm.FriendlyName
+                Write-Log ("CIMC HTTPS certificate: subject='{0}' issuer='{1}' notAfter={2} signature={3} keyBits={4}." -f $x509.Subject, $x509.Issuer, $x509.NotAfter.ToString('yyyy-MM-dd'), $sig, $keyBits)
+                if ($x509.NotAfter -lt (Get-Date)) {
+                    Write-Log -Level WARN ("This certificate expired on {0}. It is no longer valid and will be rejected by clients that verify it. The management session continues because this is the CIMC appliance certificate." -f $x509.NotAfter.ToString('yyyy-MM-dd'))
+                }
+                if ($x509.NotBefore -gt (Get-Date)) {
+                    Write-Log -Level WARN ("This certificate is not yet valid. Its validity period begins on {0}." -f $x509.NotBefore.ToString('yyyy-MM-dd'))
+                }
+                $weakRsa = ($x509.PublicKey.Oid.FriendlyName -match 'RSA' -and $keyBits -match '^\d+$' -and [int]$keyBits -lt 2048)
+                $weakEc = ($x509.PublicKey.Oid.FriendlyName -match 'ECC|ECDSA' -and $keyBits -match '^\d+$' -and [int]$keyBits -lt 256)
+                if ($weakRsa -or $weakEc) {
+                    Write-Log -Level WARN ("The certificate's public key is cryptographically weak ({0}, {1} bits). Keys of this strength are vulnerable to factorization or discrete logarithm attacks. The certificate should be re-issued using at least an RSA 2048-bit key or an ECDSA key on a P-256 (or higher) curve." -f $x509.PublicKey.Oid.FriendlyName, $keyBits)
+                }
+                if ($sig -match 'md5|sha1') {
+                    Write-Log -Level WARN ("The certificate is signed with the insecure algorithm '{0}'. This makes it vulnerable to collision attacks, potentially allowing for certificate forgery. It must be re-issued using a signature based on the SHA-2 family (for example, sha256WithRSAEncryption)." -f $sig)
+                }
+                if ($x509.Subject -eq $x509.Issuer) {
+                    Write-Log 'This is a self-signed certificate. It is accepted for this CIMC management session only.'
+                }
+            }
+            catch {
+                Write-Log -Level WARN 'CIMC presented an HTTPS certificate that could not be inspected. The management session continues.'
+            }
+        }
+        return $true
+    }
+    $script:CimcXmlTlsReady = $true
+}
+
+function ConvertTo-CimcXmlValue {
+    param([AllowNull()][string]$Value)
+    if ([string]::IsNullOrEmpty($Value)) { return '' }
+    return [System.Security.SecurityElement]::Escape($Value)
+}
+
+function Send-CimcXmlRequest {
+    param(
+        [Parameter(Mandatory)][string]$CimcIp,
+        [Parameter(Mandatory)][string]$Body,
+        [int]$TimeoutSec = 90
+    )
+    Initialize-CimcXmlTls
+    $uri = "https://$CimcIp/nuova"
+    $req = [System.Net.HttpWebRequest]::Create($uri)
+    $req.Method = 'POST'
+    $req.ContentType = 'text/xml'
+    $req.Accept = 'text/xml'
+    $req.Timeout = $TimeoutSec * 1000
+    $req.ReadWriteTimeout = $TimeoutSec * 1000
+    $req.KeepAlive = $false
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($Body)
+    $req.ContentLength = $bytes.Length
+    $stream = $req.GetRequestStream()
+    try { $stream.Write($bytes, 0, $bytes.Length) } finally { $stream.Close() }
+    $response = $null
+    try {
+        $response = $req.GetResponse()
+        $reader = New-Object System.IO.StreamReader($response.GetResponseStream())
+        try { return $reader.ReadToEnd() } finally { $reader.Close() }
+    }
+    catch [System.Net.WebException] {
+        $http = $_.Exception.Response
+        if (-not $http) { throw }
+        $reader = New-Object System.IO.StreamReader($http.GetResponseStream())
+        try { return $reader.ReadToEnd() } finally { $reader.Close() }
+    }
+    finally {
+        if ($response) { $response.Close() }
+    }
+}
+
+function Connect-CimcXml {
+    param([Parameter(Mandatory)][string]$CimcIp)
+    $user = ConvertTo-CimcXmlValue $script:CimcUsername
+    $pass = ConvertTo-CimcXmlValue $script:CimcPassword
+    # The login body contains the CIMC password. It is not written to the log.
+    $body = "<aaaLogin inName=`"$user`" inPassword=`"$pass`"/>"
+    $text = Send-CimcXmlRequest -CimcIp $CimcIp -Body $body -TimeoutSec 60
+    if ($text -match 'errorDescr="([^"]+)"' -and $text -match 'errorCode="([^"]+)"' -and $Matches[1]) {
+        $why = ([regex]::Match($text, 'errorDescr="([^"]*)"')).Groups[1].Value
+        throw "CIMC XML login failed: $why"
+    }
+    $cookie = [regex]::Match($text, 'outCookie="([^"]+)"')
+    if (-not $cookie.Success) { throw 'CIMC XML login did not return a session cookie.' }
+    return $cookie.Groups[1].Value
+}
+
+function Get-CimcHuuStatus {
+    param(
+        [Parameter(Mandatory)][string]$CimcIp,
+        [Parameter(Mandatory)][string]$Cookie
+    )
+    $safeCookie = ConvertTo-CimcXmlValue $Cookie
+    $body = "<configResolveDn cookie=`"$safeCookie`" dn=`"sys/huu/firmwareUpdater/updateStatus`" inHierarchical=`"true`"/>"
+    $text = Send-CimcXmlRequest -CimcIp $CimcIp -Body $body -TimeoutSec 90
+    if ($text -match 'errorCode="([^"]+)"' -and $Matches[1]) {
+        $why = ([regex]::Match($text, 'errorDescr="([^"]*)"')).Groups[1].Value
+        throw "CIMC status query failed: $why"
+    }
+    $doc = New-Object System.Xml.XmlDocument
+    $doc.LoadXml($text)
+    $status = $doc.GetElementsByTagName('huuFirmwareUpdateStatus') | Select-Object -First 1
+    $components = @()
+    foreach ($node in $doc.GetElementsByTagName('huuUpdateComponentStatus')) {
+        $components += [pscustomobject]@{
+            Name    = $node.GetAttribute('component')
+            Update  = $node.GetAttribute('updateStatus')
+            Verify  = $node.GetAttribute('verifyStatus')
+            Running = $node.GetAttribute('runningVersion')
+            New     = $node.GetAttribute('newVersion')
+            Error   = $node.GetAttribute('errorDescription')
+        }
+    }
+    return [pscustomobject]@{
+        StartTime  = if ($status) { $status.GetAttribute('updateStartTime') } else { '' }
+        EndTime    = if ($status) { $status.GetAttribute('updateEndTime') } else { '' }
+        Overall    = if ($status) { $status.GetAttribute('overallStatus') } else { '' }
+        Image      = if ($status) { $status.GetAttribute('huuImageVersion') } else { '' }
+        Components = $components
+    }
+}
+
+function Get-CimcHuuShare {
+    param(
+        [Parameter(Mandatory)][string]$BaseUrl,
+        [Parameter(Mandatory)][string]$IsoFile
+    )
+    $uri = [Uri]$BaseUrl
+    $port = if ($uri.IsDefaultPort) { '' } else { ":$($uri.Port)" }
+    $remoteIp = '{0}://{1}{2}' -f $uri.Scheme, $uri.Host, $port
+    $path = $uri.AbsolutePath
+    if (-not $path.EndsWith('/')) { $path += '/' }
+    $remoteShare = ($path + $IsoFile) -replace '(?<!:)/{2,}', '/'
+    return [pscustomobject]@{ Ip = $remoteIp; Share = $remoteShare }
+}
+
+function Invoke-CimcHuuUpgrade {
+    # Ask CIMC to boot the HUU ISO and run its non-interactive update.
+    # updateComponent "all,hdd" is Cisco's token for every component the ISO
+    # contains, including drives. The same job updates and activates them.
+    param(
+        [Parameter(Mandatory)][string]$CimcIp,
+        [Parameter(Mandatory)][string]$RemoteIp,
+        [Parameter(Mandatory)][string]$RemoteShare,
+        [string]$ShareUser,
+        [string]$SharePass,
+        [Parameter(Mandatory)][object]$Fw
+    )
+    $component = if ($Fw.updateComponent) { [string]$Fw.updateComponent } else { 'all,hdd' }
+    $timeoutMin = if ($Fw.updateTimeoutMin) { [int]$Fw.updateTimeoutMin } else { 240 }
+    if ($timeoutMin -lt 30) { $timeoutMin = 30 }
+    if ($timeoutMin -gt 240) { $timeoutMin = 240 }
+    $secure = 'yes'
+    if ($Fw.PSObject.Properties.Name -contains 'cimcSecureBoot' -and -not [bool]$Fw.cimcSecureBoot) { $secure = 'no' }
+
+    Write-Log "Signing in to CIMC at https://$CimcIp/ to start the HUU update."
+    $script:HuuJobStarted = $false
+    $cookie = Connect-CimcXml -CimcIp $CimcIp
+    $prior = Get-CimcHuuStatus -CimcIp $CimcIp -Cookie $cookie
+    $oldEnd = [string]$prior.EndTime
+    $oldStart = [string]$prior.StartTime
+    $oldOverall = [string]$prior.Overall
+
+    $xmlUser = ConvertTo-CimcXmlValue $ShareUser
+    $xmlPass = ConvertTo-CimcXmlValue $SharePass
+    $safeCookie = ConvertTo-CimcXmlValue $cookie
+    $body = @"
+<configConfMo cookie="$safeCookie" dn="sys/huu/firmwareUpdater" inHierarchical="false">
+  <inConfig>
+    <huuFirmwareUpdater dn="sys/huu/firmwareUpdater" adminState="trigger" mapType="www" remoteIp="$(ConvertTo-CimcXmlValue $RemoteIp)" remoteShare="$(ConvertTo-CimcXmlValue $RemoteShare)" username="$xmlUser" password="$xmlPass" updateComponent="$(ConvertTo-CimcXmlValue $component)" stopOnError="no" timeOut="$timeoutMin" verifyUpdate="no" cimcSecureBoot="$secure" updateType="immediate" doForceDown="yes" gracefulTimeout="3" bootMedium="vmedia" status="modified"/>
+  </inConfig>
+</configConfMo>
+"@
+    Write-Log "Starting HUU update and activate for '$component' from $RemoteIp$RemoteShare. CIMC allows up to $timeoutMin minutes. Leave this window open."
+    Write-Host ''
+    Write-Host "HUU is updating and activating every component. This often takes one to three hours." -ForegroundColor Yellow
+    Write-Host "The ISO stays available from this laptop until CIMC reports the job finished." -ForegroundColor Yellow
+    $trigger = Send-CimcXmlRequest -CimcIp $CimcIp -Body $body -TimeoutSec 180
+    if ($trigger -match 'errorCode="([^"]+)"' -and $Matches[1]) {
+        $why = ([regex]::Match($trigger, 'errorDescr="([^"]*)"')).Groups[1].Value
+        if (-not $why) { $why = 'CIMC rejected the HUU update request.' }
+        throw $why
+    }
+    $script:HuuJobStarted = $true
+
+    $deadline = (Get-Date).AddMinutes($timeoutMin + 30)
+    $seenActive = $false
+    $lastSummary = ''
+    $lastBeat = [datetime]::MinValue
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Seconds 20
+        $status = $null
+        try {
+            if (-not $cookie) { $cookie = Connect-CimcXml -CimcIp $CimcIp }
+            $status = Get-CimcHuuStatus -CimcIp $CimcIp -Cookie $cookie
+        }
+        catch {
+            Write-Log "CIMC HTTPS is not answering ($($_.Exception.Message)). Firmware activation reboots CIMC. Still waiting."
+            $cookie = $null
+            continue
+        }
+        $start = [string]$status.StartTime
+        $end = [string]$status.EndTime
+        $overall = [string]$status.Overall
+        if ($start -and $start -ne $oldStart -and $start -notmatch '^(NA|N/A|none)?$') { $seenActive = $true }
+        if ($overall -and $overall -ne $oldOverall -and $overall -match '(?i)progress|running|updating|activat|boot|trigger') { $seenActive = $true }
+        $lines = @()
+        foreach ($item in @($status.Components)) {
+            $label = $item.Name
+            if ($item.Update) { $label = "$label $($item.Update)" }
+            if ($item.Error) { $label = "$label ($($item.Error))" }
+            $lines += $label
+        }
+        $summary = ($overall, ($lines -join '; ')) -join ' | '
+        if ($summary -and $summary -ne $lastSummary) {
+            $lastSummary = $summary
+            $shown = $summary
+            if ($shown.Length -gt 500) { $shown = $shown.Substring(0, 500) }
+            Write-Log "HUU: $shown"
+        }
+        elseif (((Get-Date) - $lastBeat).TotalSeconds -ge 120) {
+            $lastBeat = Get-Date
+            Write-Log 'HUU is still running. The ISO server stays up.'
+        }
+        $endIsNew = $end -and $end -notmatch '^(NA|N/A|none|null)?$' -and $end -ne $oldEnd
+        if ($seenActive -and $endIsNew) {
+            Write-Log "HUU finished. Image '$($status.Image)'. Overall: $overall"
+            $failed = @()
+            foreach ($item in @($status.Components)) {
+                $detail = "{0}: update={1}; verify={2}; running={3}; new={4}" -f $item.Name, $item.Update, $item.Verify, $item.Running, $item.New
+                if ($item.Error) { $detail = "$detail; error=$($item.Error)" }
+                Write-Log $detail
+                if (($item.Update + ' ' + $item.Error) -match '(?i)fail|error') { $failed += $item.Name }
+            }
+            if ($failed.Count -gt 0 -or $overall -match '(?i)\b(fail|error)\b') {
+                $which = if ($failed.Count -gt 0) { $failed -join ', ' } else { $overall }
+                throw "HUU finished with failures: $which"
+            }
+            return
+        }
+    }
+    throw "HUU did not finish within $($timeoutMin + 30) minutes."
+}
+
+function Repair-CimcBootAfterHuu {
+    # The upgrade used a one-time boot of the ISO. Put the local drive first
+    # and drop the mapping so the next reboot is the installed system.
+    param(
+        [Parameter(Mandatory)][System.IO.Ports.SerialPort]$Port,
+        [Parameter(Mandatory)][object]$Config,
+        [Parameter(Mandatory)][object]$Fw
+    )
+    $cmdTO   = [int]$Config.behavior.commandTimeoutSec
+    $delayMs = [int]$Config.behavior.interCommandDelayMs
+    $volume  = if ($Fw.vmediaVolume) { [string]$Fw.vmediaVolume } else { 'firmware' }
+    $lunName = if ($Fw.localBootName) { [string]$Fw.localBootName } else { 'LocalLUN' }
+    $shellName = if ($Fw.uefiShellName) { [string]$Fw.uefiShellName } else { 'UefiShell' }
+    try {
+        if (-not (Sync-CimcPrompt -Port $Port -Attempts 3 -TimeoutSec 5)) {
+            Invoke-CimcLogin -Port $Port -Behavior $Config.behavior
+        }
+        Send-Command -Port $Port -Command 'top' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+        Send-Command -Port $Port -Command 'scope vmedia' -ExpectPatterns @('#\s*$','Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+        $unmap = Send-Command -Port $Port -Command "unmap $volume" `
+            -ExpectPatterns @($script:RxCli, "(?i)enter 'yes' or 'no'", '(?i)does not exist', '(?i)not found', '(?i)invalid') `
+            -TimeoutSec $cmdTO -InterDelayMs $delayMs
+        if ($unmap -match "(?i)enter 'yes' or 'no'" -and $unmap -notmatch $script:RxCli) {
+            Send-Command -Port $Port -Command 'no' -ExpectPatterns @($script:RxCli, '(?i)invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+        }
+        Send-Command -Port $Port -Command 'top' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+        Send-Command -Port $Port -Command 'scope bios' -ExpectPatterns @('#\s*$','Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+        $listed = Send-Command -Port $Port -Command 'show boot-device' -ExpectPatterns @('#\s*$') -TimeoutSec $cmdTO -InterDelayMs $delayMs
+        $known = @(Get-CimcBootDeviceNames -Text $listed)
+        if ($known -notcontains $lunName) {
+            Write-Log -Level WARN "Boot device '$lunName' is not in the CIMC list. The ISO mapping was removed. Put the boot drive first in the CIMC boot order if the server comes back on the HUU."
+            return
+        }
+        $ordered = @($lunName)
+        foreach ($name in $known) {
+            if ($name -ne $lunName -and $name -ne $shellName -and $ordered -notcontains $name) { $ordered += $name }
+        }
+        if ($known -contains $shellName) { $ordered += $shellName }
+        $pairs = @()
+        for ($i = 0; $i -lt $ordered.Count; $i++) { $pairs += ('{0}:{1}' -f $ordered[$i], ($i + 1)) }
+        $rearrange = 'rearrange-boot-device ' + ($pairs -join ',')
+        Write-Log "Restoring the boot drive to the top: $rearrange"
+        Send-Command -Port $Port -Command $rearrange -ExpectPatterns @('#\s*$', '(?i)invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+    }
+    catch {
+        Write-Log -Level WARN "The upgrade finished, but the boot drive was not moved back to the top: $($_.Exception.Message)"
+    }
+}
+
 function Invoke-CimcPowerCycle {
     param(
         [Parameter(Mandatory)][System.IO.Ports.SerialPort]$Port,
@@ -1845,48 +2158,70 @@ function Invoke-FirmwareUpgrade {
             }
             Start-Sleep -Milliseconds 500
             Write-Log "HTTP lines above are this laptop checking the ISO. A later HTTP line from the CIMC address means the mount reached the laptop."
-            Set-CimcVmediaMap -Port $SerialPort -Config $Config -Volume $volume -BaseUrl $baseUrl -IsoFile $isoFile `
-                -User ([string]$fw.shareUser) -Pass ([string]$fw.sharePassword) | Out-Null
         }
         elseif ($transport -ieq 'url') {
             $baseUrl = ([string]$fw.shareUrl).Trim().TrimEnd('/')
             if (-not $baseUrl) { throw 'firmware.transport is "url" but firmware.shareUrl is not set.' }
             $baseUrl = "${baseUrl}/"
-            Set-CimcVmediaMap -Port $SerialPort -Config $Config -Volume $volume -BaseUrl $baseUrl -IsoFile $isoFile `
-                -User ([string]$fw.shareUser) -Pass ([string]$fw.sharePassword) | Out-Null
         }
         else {
             throw "Unknown firmware.transport '$transport' (expected 'http-local' or 'url')."
         }
 
-        # map-www can return to /vmedia # and then stop reading the serial port
-        # while CIMC finishes the mount. Losing the next command must not stop
-        # the ISO server: the mapping is already saved.
-        $bootOrderSet = $false
+        if (-not $TargetIp) { throw 'The server entry has no ipAddress, so the HUU update cannot be started.' }
+        $share = Get-CimcHuuShare -BaseUrl $baseUrl -IsoFile $isoFile
+        $upgraded = $false
+        $script:HuuJobStarted = $false
+        $huuError = $null
         try {
-            if (-not (Sync-CimcPrompt -Port $SerialPort -Attempts 3 -TimeoutSec 5)) {
-                throw "The serial console did not return a prompt after the ISO was mapped."
-            }
-            Set-CimcVmediaBootOrder -Port $SerialPort -Config $Config -Fw $fw
-            if ($powerCyc) { Invoke-CimcPowerCycle -Port $SerialPort -Config $Config }
-            $bootOrderSet = $true
+            Invoke-CimcHuuUpgrade -CimcIp $TargetIp -RemoteIp $share.Ip -RemoteShare $share.Share `
+                -ShareUser ([string]$fw.shareUser) -SharePass ([string]$fw.sharePassword) -Fw $fw
+            $upgraded = $true
         }
         catch {
-            Write-Log -Level WARN "ISO is mapped, but the boot order was not changed: $($_.Exception.Message)"
+            $huuError = $_.Exception.Message
+            if ($script:CimcPassword -and $huuError.Contains($script:CimcPassword)) { $huuError = $huuError.Replace($script:CimcPassword, '<redacted>') }
+            Write-Log -Level WARN "Automatic HUU update did not finish: $huuError"
         }
 
-        if ($server) {
+        if ($upgraded) {
+            Repair-CimcBootAfterHuu -Port $SerialPort -Config $Config -Fw $fw
             Write-Host ''
-            if ($bootOrderSet) {
-                Write-Host "ISO is mapped and the server is booting to it. The local HTTP server must stay running" -ForegroundColor Yellow
-                Write-Host "while the CIMC reads the media (this can take a long time for a firmware update)." -ForegroundColor Yellow
-            } else {
-                Write-Host "The ISO is mapped. The serial console stopped answering, so the boot order was not changed." -ForegroundColor Yellow
-                Write-Host "In CIMC, set the boot order to KVM mapped DVD, CIMC mapped vDVD, the boot drive, then UEFI shell, and enable UEFI secure boot. Then power-cycle the server." -ForegroundColor Yellow
-                Write-Host "The local HTTP server must stay running while the CIMC reads the ISO." -ForegroundColor Yellow
+            Write-Host "Firmware update and activate finished. The server is set to boot its drive." -ForegroundColor Yellow
+        }
+        elseif ($script:HuuJobStarted) {
+            throw $huuError
+        }
+        else {
+            # CIMC did not accept the non-interactive job. Fall back to mapping
+            # the ISO and booting it so the HUU menu is reachable.
+            Set-CimcVmediaMap -Port $SerialPort -Config $Config -Volume $volume -BaseUrl $baseUrl -IsoFile $isoFile `
+                -User ([string]$fw.shareUser) -Pass ([string]$fw.sharePassword) | Out-Null
+            $bootOrderSet = $false
+            try {
+                if (-not (Sync-CimcPrompt -Port $SerialPort -Attempts 3 -TimeoutSec 5)) {
+                    throw "The serial console did not return a prompt after the ISO was mapped."
+                }
+                Set-CimcVmediaBootOrder -Port $SerialPort -Config $Config -Fw $fw
+                if ($powerCyc) { Invoke-CimcPowerCycle -Port $SerialPort -Config $Config }
+                $bootOrderSet = $true
             }
-            Write-Host "Press Enter here ONLY when the upgrade is complete to stop serving the ISO..." -ForegroundColor Yellow
-            [void](Read-Host)
+            catch {
+                Write-Log -Level WARN "ISO is mapped, but the boot order was not changed: $($_.Exception.Message)"
+            }
+            if ($server) {
+                Write-Host ''
+                if ($bootOrderSet) {
+                    Write-Host "Automatic HUU did not start. The ISO is mapped and the server is booting to it." -ForegroundColor Yellow
+                    Write-Host "In the HUU screen, choose Update and Activate for all components." -ForegroundColor Yellow
+                } else {
+                    Write-Host "Automatic HUU did not start, and the serial console stopped answering." -ForegroundColor Yellow
+                    Write-Host "In CIMC, boot the mapped vDVD, then choose Update and Activate for all components." -ForegroundColor Yellow
+                }
+                Write-Host "The local HTTP server must stay running while the CIMC reads the ISO." -ForegroundColor Yellow
+                Write-Host "Press Enter here ONLY when the upgrade is complete to stop serving the ISO..." -ForegroundColor Yellow
+                [void](Read-Host)
+            }
         }
     }
     finally {

@@ -86,10 +86,11 @@
     },
 
 
-    // -------- Firmware upgrade via CIMC-mapped vMedia (optional) --------------
-    //  Boots the connected server from an ISO (e.g. the Cisco HUU firmware ISO)
-    //  by mapping it as CIMC virtual media and putting it first in the boot
-    //  order, with the local LUN second.
+    // -------- Firmware upgrade via the Host Upgrade Utility (optional) -------
+    //  Serves the HUU ISO from this laptop and tells CIMC to update and
+    //  activate every component in that ISO. The window stays open until CIMC
+    //  reports the job finished. The laptop must stay on the CIMC management
+    //  network the whole time.
     //
     //  IMPORTANT: the CIMC reads vMedia over its MANAGEMENT IP network, NOT over
     //  the serial cable. With transport "http-local" the script serves the ISO
@@ -139,7 +140,14 @@
         "uefiShellType":  "UEFISHELL",
 
         // Power-cycle the server after setting the boot order so it boots the ISO.
-        "powerCycle":     true
+        // Used only if the automatic HUU job cannot be started.
+        "powerCycle":     true,
+
+        // Non-interactive HUU. "all,hdd" updates and activates every component
+        // in the ISO, including drives. "all" skips drives. 30 to 240 minutes.
+        "updateComponent":  "all,hdd",
+        "updateTimeoutMin": 240,
+        "cimcSecureBoot":   true
     },
 
 
