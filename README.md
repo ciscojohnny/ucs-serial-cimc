@@ -67,7 +67,7 @@ This script talks to standalone CIMC, not UCS Manager. It is tested on a C220 M7
 | Step | CIMC 6.0 | CIMC 4.3 |
 | --- | --- | --- |
 | Timezone | `timezone-select`. The US list says `Central Time`. | Same command. Older menus say `Central (most areas)`. If the country list returns to the CLI prompt, the script continues and timezone is left for the UI. |
-| HUU / vMedia location | One location: `remoteIp` is `http://host:port` and `remoteShare` is `/file.iso`. | Remote share and remote file stay separate. The share is `http://host:port/` and the file is the ISO name. The HUU object rejects `remoteFile`. |
+| HUU / vMedia location | Existing maps are removed. The HUU job then mounts one location: `remoteIp` is `http://host:port` and `remoteShare` is `/file.iso`. | Existing maps are removed first. Remote share and remote file stay separate. The share is `http://host:port/` and the file is the ISO name. The HUU object rejects `remoteFile`. |
 | Boot into that ISO | The HUU job boots the ISO, accepts the license, and updates. | After the vMedia map, a delayed non-interactive update is armed, the CIMC-mapped DVD is set first (an existing DVD is reordered, not created again), and the host is power-cycled. The ISO accepts the license and updates. |
 | Drives | `updateComponent` `all` skips drives. | Same token. `all,hdd` is the only value that includes drives. |
 

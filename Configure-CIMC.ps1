@@ -25,9 +25,11 @@
       HUU www map: 6.0 takes one location, remoteIp "http://host:port" and
         remoteShare "/file.iso", and that job accepts the license itself.
         4.3 keeps remote share and remote file separate on the vMedia map.
-        After that map, arm a delayed non-interactive update, put the
-        CIMC-mapped DVD first, and power-cycle. The ISO then accepts the
-        license and updates. The HUU object rejects a remoteFile attribute.
+        Unmap every existing vMedia volume, map the new ISO, arm a delayed
+        non-interactive update, put the CIMC-mapped DVD first, and
+        power-cycle. The ISO then accepts the license and updates. The HUU
+        object rejects a remoteFile attribute. 6.0 unmaps and lets its HUU
+        job mount the ISO itself.
       updateComponent "all" skips drives. "all,hdd" includes them.
     Requires PowerShell 5.1+ or 7+ on Windows with access to a serial adapter.
 
@@ -1993,6 +1995,8 @@ function Connect-CimcXml {
         throw "CIMC XML login failed: $why"
     }
     $script:CimcXmlCookie = $cookie.Groups[1].Value
+    $version = [regex]::Match($text, 'outVersion="([^"]*)"')
+    if ($version.Success -and $version.Groups[1].Value) { $script:CimcXmlVersion = $version.Groups[1].Value }
     return $script:CimcXmlCookie
 }
 
@@ -2305,7 +2309,43 @@ function Remove-CimcWwwVolume {
         }
         return
     }
-    Write-Log "Removed vMedia volume '$Volume' so the HUU job can mount the ISO."
+    Write-Log "Removed vMedia volume '$Volume'."
+}
+
+function Clear-CimcWwwVolumes {
+    # Drop every mapped ISO before creating the new one. A volume left from
+    # an earlier run makes the next map, and the 6.0 HUU job, return
+    # ISO Mapping Error. The serial console is not required.
+    param(
+        [Parameter(Mandatory)][string]$CimcIp,
+        [Parameter(Mandatory)][string]$Volume
+    )
+    $cookie = Wait-CimcXmlReady -CimcIp $CimcIp
+    $safeCookie = ConvertTo-CimcXmlValue $cookie
+    $text = Send-CimcXmlRequest -CimcIp $CimcIp -Body "<configResolveClass cookie=`"$safeCookie`" classId=`"commVMediaMap`" inHierarchical=`"false`"/>" -TimeoutSec 60
+    $names = New-Object System.Collections.Generic.List[string]
+    if ($text -match 'errorCode="([^"]+)"' -and $Matches[1]) {
+        $why = ([regex]::Match($text, 'errorDescr="([^"]*)"')).Groups[1].Value
+        Write-Log -Level WARN "Could not list vMedia maps: $why. Removing volume '$Volume'."
+        Remove-CimcWwwVolume -CimcIp $CimcIp -Volume $Volume
+        return
+    }
+    foreach ($found in [regex]::Matches($text, '(?i)volumeName="([^"]+)"')) {
+        $name = $found.Groups[1].Value
+        if ($name -and -not $names.Contains($name)) { $names.Add($name) }
+    }
+    foreach ($found in [regex]::Matches($text, 'vmmap-([^"<\s/]+)')) {
+        $name = $found.Groups[1].Value
+        if ($name -and -not $names.Contains($name)) { $names.Add($name) }
+    }
+    if ($names.Count -eq 0) {
+        Write-Log 'No vMedia volume is mapped.'
+        return
+    }
+    foreach ($name in $names) {
+        Write-Log "Unmapping existing vMedia volume '$name'."
+        Remove-CimcWwwVolume -CimcIp $CimcIp -Volume $name
+    }
 }
 
 function Set-CimcBootDeviceXml {
@@ -2752,7 +2792,9 @@ function Wait-CimcXmlReady {
         }
         catch {
             $lastWhy = $_.Exception.Message
-            if ($lastWhy -match '(?i)login failed') { throw }
+            # An empty login body is retried. A rejected password or a full
+            # session table will not start working on the next attempt.
+            if ($lastWhy -match '(?i)maximum sessions|authentication|invalid (user|password)|credentials') { throw }
             Write-Log ("CIMC HTTPS at {0} is not ready yet ({1}s). Retrying." -f $CimcIp, [int]$sw.Elapsed.TotalSeconds)
             Start-Sleep -Seconds 15
         }
@@ -2856,26 +2898,40 @@ function Invoke-FirmwareUpgrade {
         $upgraded = $false
         $script:HuuJobStarted = $false
         $huuError = $null
-        # HUU mounts the ISO itself. A volume left from an earlier run makes
-        # that job return ISO Mapping Error. Clear it over HTTPS first. The
-        # serial unmap is a second attempt when the console is answering.
-        try { Remove-CimcWwwVolume -CimcIp $TargetIp -Volume $volume }
-        catch { Write-Log -Level WARN "Could not remove an earlier ISO mapping over HTTPS: $($_.Exception.Message)" }
-        if (-not (Restore-CimcCli -Port $SerialPort)) {
-            Write-Log -Level WARN 'The serial console did not return a prompt before the ISO unmap.'
-        }
-        try { Remove-CimcVmediaMap -Port $SerialPort -Config $Config -Volume $volume }
-        catch { Write-Log -Level WARN "Could not clear an earlier ISO mapping: $($_.Exception.Message)" }
+        $xmlMapped = $false
+        $bootOrderSet = $false
+        $mediaUpgraded = $false
+        # Every firmware path starts by dropping maps left from an earlier run.
+        # 4.3 then maps the new ISO. 6.0 leaves the map empty and lets the HUU
+        # job mount the ISO itself.
+        $mapsCleared = $false
         try {
-            Invoke-CimcHuuUpgrade -CimcIp $TargetIp -RemoteIp $share.Ip -RemoteShare $share.Share `
-                -MapRetryIp $share.Host -MapRetryShare $share.ShareUrl -ShareDir $share.ShareDir -RemoteFile $share.File `
-                -ShareUser ([string]$fw.shareUser) -SharePass ([string]$fw.sharePassword) -Fw $fw
-            $upgraded = $true
+            Clear-CimcWwwVolumes -CimcIp $TargetIp -Volume $volume
+            $mapsCleared = $true
         }
-        catch {
-            $huuError = $_.Exception.Message
-            if ($script:CimcPassword -and $huuError.Contains($script:CimcPassword)) { $huuError = $huuError.Replace($script:CimcPassword, '<redacted>') }
-            Write-Log -Level WARN "Automatic HUU update did not finish: $huuError"
+        catch { Write-Log -Level WARN "Could not remove an earlier ISO mapping over HTTPS: $($_.Exception.Message)" }
+        if (-not $mapsCleared) {
+            if (-not (Restore-CimcCli -Port $SerialPort)) {
+                Write-Log -Level WARN 'The serial console did not return a prompt before the ISO unmap.'
+            }
+            try { Remove-CimcVmediaMap -Port $SerialPort -Config $Config -Volume $volume }
+            catch { Write-Log -Level WARN "Could not clear an earlier ISO mapping: $($_.Exception.Message)" }
+        }
+        if ($script:CimcXmlVersion) { Write-Log "CIMC firmware version $($script:CimcXmlVersion)." }
+        else { Write-Log -Level WARN 'CIMC did not report a firmware version. The HUU job will mount the ISO.' }
+        $useMappedDvd = $script:CimcXmlVersion -match '^4\.'
+        if (-not $useMappedDvd) {
+            try {
+                Invoke-CimcHuuUpgrade -CimcIp $TargetIp -RemoteIp $share.Ip -RemoteShare $share.Share `
+                    -MapRetryIp $share.Host -MapRetryShare $share.ShareUrl -ShareDir $share.ShareDir -RemoteFile $share.File `
+                    -ShareUser ([string]$fw.shareUser) -SharePass ([string]$fw.sharePassword) -Fw $fw
+                $upgraded = $true
+            }
+            catch {
+                $huuError = $_.Exception.Message
+                if ($script:CimcPassword -and $huuError.Contains($script:CimcPassword)) { $huuError = $huuError.Replace($script:CimcPassword, '<redacted>') }
+                Write-Log -Level WARN "Automatic HUU update did not finish: $huuError"
+            }
         }
 
         if ($upgraded) {
@@ -2887,7 +2943,7 @@ function Invoke-FirmwareUpgrade {
             Write-Host ''
             Write-Host "Firmware update and activate finished. The server is set to boot its drive." -ForegroundColor Yellow
         }
-        elseif ($script:HuuJobStarted -and $huuError -notmatch '(?i)ISO Mapping Error') {
+        elseif (-not $useMappedDvd -and $script:HuuJobStarted -and $huuError -notmatch '(?i)ISO Mapping Error') {
             throw $huuError
         }
         else {
@@ -2895,11 +2951,13 @@ function Invoke-FirmwareUpgrade {
             # The HUU object cannot take remoteFile. Once the volume is mapped,
             # boot order and the power cycle go over HTTPS so a dead serial
             # console does not leave the host on its disk.
-            $xmlMapped = $false
-            $bootOrderSet = $false
-            $mediaUpgraded = $false
-            if ($huuError -match '(?i)ISO Mapping Error') {
-                Write-Log '4.3 keeps remote share and remote file separate. Mapping that volume, then booting the CIMC-mapped DVD.'
+            if ($useMappedDvd -or $huuError -match '(?i)ISO Mapping Error') {
+                if ($useMappedDvd) {
+                    Write-Log "CIMC $($script:CimcXmlVersion) keeps remote share and remote file separate. Existing vMedia maps are cleared. Mapping the new ISO, then booting the CIMC-mapped DVD."
+                }
+                else {
+                    Write-Log '4.3 keeps remote share and remote file separate. Mapping that volume, then booting the CIMC-mapped DVD.'
+                }
                 try {
                     $xmlMapped = Set-CimcWwwVolume -CimcIp $TargetIp -Volume $volume -ShareDir $share.ShareDir -IsoFile $isoFile `
                         -User ([string]$fw.shareUser) -Pass ([string]$fw.sharePassword)
