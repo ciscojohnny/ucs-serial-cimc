@@ -945,6 +945,7 @@ function Set-CimcNtp {
         }
         catch {
             Write-Log -Level WARN "Timezone step did not finish: $($_.Exception.Message). Set it in the CIMC UI (Admin > Timezone)."
+            Sync-CimcPrompt -Port $Port | Out-Null
         }
     }
     Write-Log 'NTP configured.'
@@ -1016,7 +1017,10 @@ function Set-CimcTimezone {
     Send-Command -Port $Port -Command 'scope cimc' -TimeoutSec $TimeoutSec -InterDelayMs $InterDelayMs | Out-Null
     # Wait for the menu prompt (#?). A CLI prompt ending in '#' arrives before
     # the region list on some firmware and used to cut the read off early.
-    $menuWait = @('(?m)#\?\s*$', '(?i)Continue\?', '(?i)above information OK')
+    # Some 4.3 menus print the list and return to the CLI prompt instead of '#?'.
+    # The last pattern matches that. It does not match '#?', and it does not
+    # match a prompt that arrives before any numbered entry.
+    $menuWait = @('(?m)#\?\s*$', '(?i)Continue\?', '(?i)above information OK', '(?s)\d+\).+\n.*#\s*$')
     $menuTimeout = [Math]::Max($TimeoutSec, 45)
     $menu = Send-Command -Port $Port -Command 'timezone-select' `
         -ExpectPatterns $menuWait -TimeoutSec $menuTimeout -InterDelayMs $InterDelayMs
@@ -1050,6 +1054,11 @@ function Set-CimcTimezone {
         Write-Log "Timezone menu: $choice) $wanted"
         $menu = Send-Command -Port $Port -Command $choice `
             -ExpectPatterns $menuWait -TimeoutSec $menuTimeout -InterDelayMs $InterDelayMs
+        if ($menu -notmatch '(?m)#\?\s*$' -and $menu -notmatch '(?i)Continue\?' -and $menu -notmatch '(?i)above information OK' -and $menu -match '(?m)#\s*$') {
+            Write-Log -Level WARN "timezone-select returned to the CLI before '$Name' was confirmed. Set it in the CIMC UI (Admin > Timezone)."
+            Sync-CimcPrompt -Port $Port | Out-Null
+            return
+        }
     }
 
     if ($menu -match '(?i)above information OK') {
@@ -1932,8 +1941,39 @@ function Send-CimcXmlRequest {
     }
 }
 
+function Test-CimcXmlCookie {
+    param(
+        [Parameter(Mandatory)][string]$CimcIp,
+        [Parameter(Mandatory)][string]$Cookie
+    )
+    $safe = ConvertTo-CimcXmlValue $Cookie
+    try {
+        $text = Send-CimcXmlRequest -CimcIp $CimcIp -Body "<aaaKeepAlive cookie=`"$safe`"/>" -TimeoutSec 20
+    }
+    catch { return $false }
+    if ($text -match 'errorCode="') { return $false }
+    return $true
+}
+
+function Disconnect-CimcXml {
+    # One XML login is enough for the firmware step. Leaving it open fills
+    # CIMC's session limit and the next login returns "Maximum sessions reached".
+    param([Parameter(Mandatory)][string]$CimcIp)
+    if (-not $script:CimcXmlCookie) { return }
+    $safe = ConvertTo-CimcXmlValue $script:CimcXmlCookie
+    try {
+        Send-CimcXmlRequest -CimcIp $CimcIp -Body "<aaaLogout cookie=`"$safe`" inCookie=`"$safe`"/>" -TimeoutSec 20 | Out-Null
+    }
+    catch {}
+    $script:CimcXmlCookie = $null
+}
+
 function Connect-CimcXml {
     param([Parameter(Mandatory)][string]$CimcIp)
+    if ($script:CimcXmlCookie -and (Test-CimcXmlCookie -CimcIp $CimcIp -Cookie $script:CimcXmlCookie)) {
+        return $script:CimcXmlCookie
+    }
+    $script:CimcXmlCookie = $null
     $user = ConvertTo-CimcXmlValue $script:CimcUsername
     $pass = ConvertTo-CimcXmlValue $script:CimcPassword
     # The login body contains the CIMC password. It is not written to the log.
@@ -1941,11 +1981,15 @@ function Connect-CimcXml {
     $text = Send-CimcXmlRequest -CimcIp $CimcIp -Body $body -TimeoutSec 60
     if ($text -match 'errorDescr="([^"]+)"' -and $text -match 'errorCode="([^"]+)"' -and $Matches[1]) {
         $why = ([regex]::Match($text, 'errorDescr="([^"]*)"')).Groups[1].Value
+        if ($why -match '(?i)maximum sessions') {
+            throw "CIMC XML login failed: $why. Close extra CIMC browser sessions, or wait for the sessions from the previous run to expire, and run the script again."
+        }
         throw "CIMC XML login failed: $why"
     }
     $cookie = [regex]::Match($text, 'outCookie="([^"]+)"')
     if (-not $cookie.Success) { throw 'CIMC XML login did not return a session cookie.' }
-    return $cookie.Groups[1].Value
+    $script:CimcXmlCookie = $cookie.Groups[1].Value
+    return $script:CimcXmlCookie
 }
 
 function Get-CimcHuuStatus {
@@ -2249,7 +2293,7 @@ function Remove-CimcWwwVolume {
     $removed = Send-CimcXmlRequest -CimcIp $CimcIp -Body $delete -TimeoutSec 60
     if ($removed -match 'errorCode="([^"]+)"' -and $Matches[1]) {
         $why = ([regex]::Match($removed, 'errorDescr="([^"]*)"')).Groups[1].Value
-        if ($why -match '(?i)exist|found|absent|none') {
+        if ($why -match '(?i)exist|found|absent|none|incorrect DN') {
             Write-Log "No vMedia volume '$Volume' was mapped."
         }
         else {
@@ -2909,6 +2953,9 @@ function Invoke-FirmwareUpgrade {
         }
     }
     finally {
+        if ($TargetIp) {
+            try { Disconnect-CimcXml -CimcIp $TargetIp } catch {}
+        }
         if ($server) { Stop-IsoHttpServer -Proc $server }
     }
 }
