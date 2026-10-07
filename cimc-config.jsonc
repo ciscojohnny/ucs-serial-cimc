@@ -125,12 +125,18 @@
         "shareUser":      null,
         "sharePassword":  null,
 
-        // vMedia + boot-order tuning (defaults suit most CIMC 4.x/5.x).
+        // vMedia + boot-order tuning (defaults suit CIMC 4.x/5.x/6.x).
+        // The script applies these together with rearrange-boot-device:
+        //   1 KVM mapped DVD, 2 CIMC mapped vDVD, 3 boot drive, UEFI shell last.
         "vmediaVolume":   "firmware",
-        "vmediaSubtype":  "CIMCMAPPEDDVD",   // CIMC-mapped vDVD subtype
-        "dvdBootName":    "vDVD",            // precision boot device name (order 1)
-        "localBootName":  "LocalLUN",        // local boot device name (order 2)
-        "localBootType":  "LOCALHDD",        // device type for the local LUN
+        "kvmBootName":    "KvmDvd",
+        "kvmSubtype":     "KVMMAPPEDDVD",
+        "vmediaSubtype":  "CIMCMAPPEDDVD",
+        "dvdBootName":    "vDVD",
+        "localBootName":  "LocalLUN",
+        "localBootType":  "LOCALHDD",
+        "uefiShellName":  "UefiShell",
+        "uefiShellType":  "UEFISHELL",
 
         // Power-cycle the server after setting the boot order so it boots the ISO.
         "powerCycle":     true

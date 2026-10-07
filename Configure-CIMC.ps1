@@ -1624,8 +1624,67 @@ function Wait-CimcHttpClient {
     return @()
 }
 
+function Get-CimcBootDeviceNames {
+    # Pull device names out of "show boot-device". The table is padded, and the
+    # command echo is included in the serial buffer.
+    param([string]$Text)
+    $names = @()
+    foreach ($line in ($Text -split "[`r`n]+")) {
+        $line = $line.Trim()
+        if ($line -notmatch '^([A-Za-z0-9][A-Za-z0-9._-]*)\s+(VMEDIA|LOCALHDD|HDD|UEFISHELL|EFI|PXE|USB|SAN|SDCARD|SD|HTTP|HTTPS|PCHSTORAGE|ISCSI|NVME)\s+') { continue }
+        $name = $Matches[1]
+        if ($names -notcontains $name) { $names += $name }
+    }
+    return $names
+}
+
+function Set-CimcPrecisionBootDevice {
+    # Create the device when it is missing, then enable it. Order is applied
+    # later for every device in one rearrange-boot-device command. Cisco says
+    # setting order on one device at a time does not keep the displayed order.
+    param(
+        [Parameter(Mandatory)][System.IO.Ports.SerialPort]$Port,
+        [Parameter(Mandatory)][int]$TimeoutSec,
+        [Parameter(Mandatory)][int]$InterDelayMs,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][string]$Type,
+        [string]$Subtype
+    )
+    $scope = Send-Command -Port $Port -Command ("scope boot-device {0}" -f $Name) `
+        -ExpectPatterns @('#\s*$', '(?i)invalid', '(?i)does not exist', '(?i)not found') `
+        -TimeoutSec $TimeoutSec -InterDelayMs $InterDelayMs
+    if ($scope -match '(?i)invalid|does not exist|not found') {
+        $created = Send-CimcConfirm -Port $Port -Command ("create-boot-device {0} {1}" -f $Name, $Type) `
+            -TimeoutSec $TimeoutSec -InterDelayMs $InterDelayMs
+        if ($created -match '(?i)invalid') {
+            Write-Log -Level WARN "Could not create boot device '$Name' of type '$Type'."
+            return
+        }
+        Send-CimcConfirm -Port $Port -Command 'commit' -TimeoutSec $TimeoutSec -InterDelayMs $InterDelayMs | Out-Null
+        Send-Command -Port $Port -Command ("scope boot-device {0}" -f $Name) `
+            -ExpectPatterns @('#\s*$', '(?i)invalid') -TimeoutSec $TimeoutSec -InterDelayMs $InterDelayMs | Out-Null
+    }
+    if ($Subtype) {
+        $subResp = Send-Command -Port $Port -Command ("set subtype {0}" -f $Subtype) `
+            -ExpectPatterns @('#\s*$', '(?i)invalid') -TimeoutSec $TimeoutSec -InterDelayMs $InterDelayMs
+        if ($subResp -match '(?i)invalid') {
+            Write-Log -Level WARN "Boot subtype '$Subtype' was rejected for '$Name'."
+        }
+    }
+    Send-Command -Port $Port -Command 'set state Enabled' `
+        -ExpectPatterns @('#\s*$', '(?i)invalid') -TimeoutSec $TimeoutSec -InterDelayMs $InterDelayMs | Out-Null
+    Send-CimcConfirm -Port $Port -Command 'commit' -TimeoutSec $TimeoutSec -InterDelayMs $InterDelayMs | Out-Null
+    Send-Command -Port $Port -Command 'exit' -ExpectPatterns @('#\s*$') -TimeoutSec $TimeoutSec -InterDelayMs $InterDelayMs | Out-Null
+}
+
 function Set-CimcVmediaBootOrder {
-    # Precision boot order: mapped vDVD first, local LUN second.
+    # Precision boot order, applied in one rearrange so the list stays put:
+    #   1. KVM mapped DVD
+    #   2. CIMC mapped vDVD
+    #   3. local boot drive
+    #   4. any other configured devices
+    #   5. UEFI shell
+    # UEFI secure boot is enabled after the order is set.
     param(
         [Parameter(Mandatory)][System.IO.Ports.SerialPort]$Port,
         [Parameter(Mandatory)][object]$Config,
@@ -1634,42 +1693,54 @@ function Set-CimcVmediaBootOrder {
     $cmdTO   = [int]$Config.behavior.commandTimeoutSec
     $delayMs = [int]$Config.behavior.interCommandDelayMs
 
-    $dvdName   = if ($Fw.dvdBootName)   { [string]$Fw.dvdBootName }   else { 'vDVD' }
-    $dvdSub    = if ($Fw.vmediaSubtype) { [string]$Fw.vmediaSubtype } else { 'CIMCMAPPEDDVD' }
-    $lunName   = if ($Fw.localBootName) { [string]$Fw.localBootName } else { 'LocalLUN' }
-    $lunType   = if ($Fw.localBootType) { [string]$Fw.localBootType } else { 'LOCALHDD' }
+    $kvmName = if ($Fw.kvmBootName)    { [string]$Fw.kvmBootName }    else { 'KvmDvd' }
+    $kvmSub  = if ($Fw.kvmSubtype)     { [string]$Fw.kvmSubtype }     else { 'KVMMAPPEDDVD' }
+    $dvdName = if ($Fw.dvdBootName)    { [string]$Fw.dvdBootName }    else { 'vDVD' }
+    $dvdSub  = if ($Fw.vmediaSubtype)  { [string]$Fw.vmediaSubtype }  else { 'CIMCMAPPEDDVD' }
+    $lunName = if ($Fw.localBootName)  { [string]$Fw.localBootName }  else { 'LocalLUN' }
+    $lunType = if ($Fw.localBootType)  { [string]$Fw.localBootType }  else { 'LOCALHDD' }
+    $shellName = if ($Fw.uefiShellName) { [string]$Fw.uefiShellName } else { 'UefiShell' }
+    $shellType = if ($Fw.uefiShellType) { [string]$Fw.uefiShellType } else { 'UEFISHELL' }
 
     Send-Command -Port $Port -Command 'top' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
     Send-Command -Port $Port -Command 'scope bios' -ExpectPatterns @('#\s*$','Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
 
-    # Log the existing boot devices for reference/troubleshooting.
     $existing = Send-Command -Port $Port -Command 'show boot-device' -ExpectPatterns @('#\s*$') -TimeoutSec $cmdTO -InterDelayMs $delayMs
     Write-Log "Existing precision boot devices:`n$existing"
 
-    # ---- Mapped vDVD as boot device #1 ----
-    Send-CimcConfirm -Port $Port -Command ("create-boot-device {0} VMEDIA" -f $dvdName) -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-    Send-CimcConfirm -Port $Port -Command 'commit' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-    Send-Command -Port $Port -Command ("scope boot-device {0}" -f $dvdName) -ExpectPatterns @('#\s*$','Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-    $subResp = Send-Command -Port $Port -Command ("set subtype {0}" -f $dvdSub) -ExpectPatterns @('#\s*$','Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs
-    if ($subResp -match 'Invalid') {
-        Write-Log -Level WARN "vMedia boot subtype '$dvdSub' was rejected; run 'set subtype' with no value under scope boot-device $dvdName to list valid tokens (varies by firmware). Continuing without an explicit subtype."
-    }
-    Send-Command -Port $Port -Command 'set order 1'      -ExpectPatterns @('#\s*$','Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-    Send-Command -Port $Port -Command 'set state Enabled' -ExpectPatterns @('#\s*$','Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-    Send-CimcConfirm -Port $Port -Command 'commit' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-    Send-Command -Port $Port -Command 'exit' -ExpectPatterns @('#\s*$') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+    Set-CimcPrecisionBootDevice -Port $Port -TimeoutSec $cmdTO -InterDelayMs $delayMs -Name $kvmName -Type 'VMEDIA' -Subtype $kvmSub
+    Set-CimcPrecisionBootDevice -Port $Port -TimeoutSec $cmdTO -InterDelayMs $delayMs -Name $dvdName -Type 'VMEDIA' -Subtype $dvdSub
+    Set-CimcPrecisionBootDevice -Port $Port -TimeoutSec $cmdTO -InterDelayMs $delayMs -Name $lunName -Type $lunType
+    Set-CimcPrecisionBootDevice -Port $Port -TimeoutSec $cmdTO -InterDelayMs $delayMs -Name $shellName -Type $shellType
 
-    # ---- Local LUN as boot device #2 ----
-    $lunScope = Send-Command -Port $Port -Command ("scope boot-device {0}" -f $lunName) -ExpectPatterns @('#\s*$','Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs
-    if ($lunScope -match 'Invalid') {
-        Send-CimcConfirm -Port $Port -Command ("create-boot-device {0} {1}" -f $lunName, $lunType) -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-        Send-CimcConfirm -Port $Port -Command 'commit' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-        Send-Command -Port $Port -Command ("scope boot-device {0}" -f $lunName) -ExpectPatterns @('#\s*$','Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+    $listed = Send-Command -Port $Port -Command 'show boot-device' -ExpectPatterns @('#\s*$') -TimeoutSec $cmdTO -InterDelayMs $delayMs
+    $known = @(Get-CimcBootDeviceNames -Text $listed)
+    $preferred = @($kvmName, $dvdName, $lunName)
+    $ordered = @()
+    foreach ($name in ($preferred + $known)) {
+        if ($name -and $name -ne $shellName -and $ordered -notcontains $name) { $ordered += $name }
     }
-    Send-Command -Port $Port -Command 'set order 2'      -ExpectPatterns @('#\s*$','Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-    Send-Command -Port $Port -Command 'set state Enabled' -ExpectPatterns @('#\s*$','Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-    Send-CimcConfirm -Port $Port -Command 'commit' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-    Send-Command -Port $Port -Command 'exit' -ExpectPatterns @('#\s*$') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+    $ordered += $shellName
+    $pairs = @()
+    for ($i = 0; $i -lt $ordered.Count; $i++) {
+        $pairs += ('{0}:{1}' -f $ordered[$i], ($i + 1))
+    }
+    $rearrange = 'rearrange-boot-device ' + ($pairs -join ',')
+    Write-Log "Setting precision boot order: $rearrange"
+    $rearranged = Send-Command -Port $Port -Command $rearrange `
+        -ExpectPatterns @('#\s*$', '(?i)invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs
+    if ($rearranged -match '(?i)invalid') {
+        Write-Log -Level WARN "rearrange-boot-device was rejected. The individual device order was not used, because CIMC does not keep that order."
+    }
+
+    $secure = Send-Command -Port $Port -Command 'set secure-boot enable' `
+        -ExpectPatterns @('#\s*$', '(?i)invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs
+    if ($secure -match '(?i)invalid') {
+        Write-Log -Level WARN "This CIMC rejected 'set secure-boot enable'."
+    } else {
+        Send-CimcConfirm -Port $Port -Command 'commit' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+        Write-Log 'UEFI secure boot enable is committed.'
+    }
 
     $final = Send-Command -Port $Port -Command 'show boot-device' -ExpectPatterns @('#\s*$') -TimeoutSec $cmdTO -InterDelayMs $delayMs
     Write-Log "Configured precision boot order:`n$final"
@@ -1811,7 +1882,7 @@ function Invoke-FirmwareUpgrade {
                 Write-Host "while the CIMC reads the media (this can take a long time for a firmware update)." -ForegroundColor Yellow
             } else {
                 Write-Host "The ISO is mapped. The serial console stopped answering, so the boot order was not changed." -ForegroundColor Yellow
-                Write-Host "In CIMC, put the mapped vDVD first and the local disk second, then power-cycle the server." -ForegroundColor Yellow
+                Write-Host "In CIMC, set the boot order to KVM mapped DVD, CIMC mapped vDVD, the boot drive, then UEFI shell, and enable UEFI secure boot. Then power-cycle the server." -ForegroundColor Yellow
                 Write-Host "The local HTTP server must stay running while the CIMC reads the ISO." -ForegroundColor Yellow
             }
             Write-Host "Press Enter here ONLY when the upgrade is complete to stop serving the ISO..." -ForegroundColor Yellow
