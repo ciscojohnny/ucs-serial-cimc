@@ -3,26 +3,18 @@
     Configures a Cisco UCS C-Series CIMC over the serial console and preps it for Intersight claim.
 
 .DESCRIPTION
-    All tunable values (site settings, serial parameters, host IP/DNS/NTP,
-    Intersight options, password rotation policy) live in a single JSONC file
-    (cimc-config.jsonc) next to this script. Users only edit that file. JSONC
-    supports // and /* */ comments so the file is self-documenting, and trailing
-    commas are tolerated to make edits friendly for non-JSON users.
+    Edit cimc-config.jsonc, then run this script against the CIMC on -ComPort.
+    It applies the "servers" entry whose hostName matches -HostName.
 
-    The script picks the entry from the JSONC file whose 'hostName' matches the
-    -HostName parameter (case-insensitive) and applies that configuration to
-    the CIMC currently attached to -ComPort.
-
-    Drives the CIMC CLI over a serial (COM) port to set:
-        - NIC mode + NIC redundancy
-        - Static IPv4 address / subnet mask / gateway
-        - Primary & secondary DNS                  (from JSON)
-        - Hostname                                 (from JSON)
-        - DNS domain                               (from JSON)
-        - Up to 4 NTP servers + timezone           (from JSON)
-        - Sets a new CIMC admin password ONLY if the factory default is detected
-        - Enables UEFI secure boot
-        - Enables Intersight Device Connector
+    Order of operations:
+        1. Log in. Change the admin password only if CIMC is still at factory default.
+        2. Enable UEFI secure boot (takes effect on the next host reboot).
+        3. Set NIC mode, static IPv4, DNS, hostname, and DNS domain.
+        4. Enable NTP, load the NTP servers, and set the timezone.
+        5. Enable the Intersight Device Connector.
+        6. If firmware.enabled is true (or -Firmware is passed), serve the HUU
+           ISO and have CIMC update and activate every component. That boot
+           applies secure boot. Otherwise reboot the host at the end.
 
 .NOTES
     Tested against CIMC 4.x / 5.x CLI (UCS C220/C240 M5/M6/M7).
@@ -51,15 +43,10 @@ param(
 
     [string]$LogDirectory = (Join-Path $PSScriptRoot 'logs'),
 
-    # Firmware upgrade with the Host Upgrade Utility. When present, forces the
-    # firmware step on for this run (overrides "firmware".enabled=false in the
-    # config). The ISO is served from a local folder over HTTP and CIMC runs
-    # the HUU update and activate for every component. Without the firmware
-    # step, the host is rebooted at the end instead.
+    # Run the HUU upgrade this time, even when firmware.enabled is false.
     [switch]$Firmware,
 
-    # Optional per-run overrides for the firmware step (otherwise taken from the
-    # "firmware" block in the config file).
+    # Override firmware.isoFile and firmware.isoFolder for this run.
     [string]$IsoFile,
     [string]$IsoFolder
 )
@@ -1000,12 +987,10 @@ function Enable-IntersightDeviceConnector {
     }
 }
 
-# -------------------- Firmware upgrade via CIMC-mapped vMedia --------------------
-# The CIMC reads virtual media over its OWN management IP network (NOT over the
-# serial cable). So to boot an ISO that lives "on the laptop", the laptop must
-# run a web server that the CIMC's configured IP can reach, and we map the ISO
-# with `scope vmedia` / `map-www` only if the non-interactive HUU job cannot be
-# started. Normally CIMC mounts and boots the ISO itself for that job.
+# -------------------- Firmware upgrade (Host Upgrade Utility) --------------------
+# CIMC reads the ISO over its management IP, not the serial cable. The script
+# serves the ISO over HTTP. CIMC then mounts it and runs the HUU update.
+# map-www is only the fallback when that job cannot be started.
 
 function Get-LocalIPv4Addresses {
     # All usable local IPv4 addresses (skips loopback and link-local).
@@ -1492,7 +1477,8 @@ function Read-CimcSettle {
 }
 
 function Set-CimcVmediaMap {
-    # Map the ISO into a CIMC vMedia volume and verify Map-Status is OK.
+    # Map the ISO into a CIMC vMedia volume. Do not query the mapping status;
+    # that command stops answering on this CIMC.
     param(
         [Parameter(Mandatory)][System.IO.Ports.SerialPort]$Port,
         [Parameter(Mandatory)][object]$Config,
@@ -1585,10 +1571,8 @@ function Set-CimcVmediaMap {
         throw "CIMC did not return to a prompt after map-www. It may be unable to reach $BaseUrl from the CIMC management IP. Allow Python through Windows Firewall on the laptop Ethernet NIC that faces the CIMC."
     }
 
-    # Do not run "show mappings" here. On this CIMC it probes the ISO and then
-    # never returns the serial prompt, even after the mapping is visible and
-    # healthy in the CIMC UI. map-www has already returned to /vmedia #, so the
-    # boot-order commands can run. Watch the HTTP log for the CIMC address.
+    # Do not run "show mappings". On this CIMC it probes the ISO and then never
+    # returns a prompt, even when the CIMC UI already shows the map.
     $serveIp = ''
     if ($BaseUrl -match '^https?://([^/:]+)') { $serveIp = $Matches[1] }
     $cimcClient = Wait-CimcHttpClient -LogPath $script:SessionLog -LaptopAddresses @('127.0.0.1', $serveIp) -TimeoutSec 3
@@ -1719,7 +1703,8 @@ function Set-CimcVmediaBootOrder {
     #   3. local boot drive
     #   4. any other configured devices
     #   5. UEFI shell
-    # UEFI secure boot is enabled after the order is set.
+    # Used only when the automatic HUU job cannot be started. Secure boot is
+    # already set at the start of the run; this confirms it again.
     param(
         [Parameter(Mandatory)][System.IO.Ports.SerialPort]$Port,
         [Parameter(Mandatory)][object]$Config,
@@ -2218,10 +2203,8 @@ function Invoke-FirmwareUpgrade {
             # 0.0.0.0 so both 127.0.0.1 and the Ethernet IP hit this process.
             # The URL handed to CIMC is still the Ethernet address.
             $server  = Start-IsoHttpServer -Folder $isoFolder -ListenPort $listenPort -BindAddress '0.0.0.0'
-            # Cisco's map-www examples keep the trailing slash on the share
-            # (map-www vol http://host/ file.iso). Omitting it makes this CIMC
-            # request http://host:8000filename.iso, which never connects, and
-            # 'show mappings detail' then blocks until that attempt times out.
+            # Keep the trailing slash. map-www joins the share and the file name,
+            # and without the slash this CIMC requests http://host:8000filename.iso.
             $baseUrl = "http://${serveHost}:${listenPort}/"
             $loopUrl = "http://127.0.0.1:${listenPort}/"
             Write-Log "Serving ISO to CIMC at ${baseUrl}${isoFile} (the CIMC's IP must be able to reach ${serveHost}:${listenPort})."

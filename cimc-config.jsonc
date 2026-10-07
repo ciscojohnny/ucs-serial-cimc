@@ -1,21 +1,11 @@
 {
-    // =========================================================================
-    //  UCS C-Series CIMC Bulk Configuration
-    //  -----------------------------------------------------------------------
-    //  This is the ONLY file you need to edit before running the script.
+    // The only file to edit. Text values stay in quotes. true, false, and null
+    // are lowercase and unquoted. Commas go between items, not after the last one.
+    // // comments are ignored.
     //
-    //  Quick rules for editing:
-    //      * Keep the quotes "like this" around text values.
-    //      * Use true / false (lowercase, no quotes) for on/off switches.
-    //      * Use null (no quotes) when a value is not used.
-    //      * Separate items with a comma, but NEVER put a comma after the last item.
-    //      * Anything after // on a line is a comment and is ignored.
+    //   .\Configure-CIMC.ps1 -ComPort COM3 -HostName rack01-ucs01
     //
-    //  Run the script like:
-    //      .\Configure-CIMC.ps1 -ComPort COM3 -HostName rack01-ucs01
-    //
-    //  The hostName you pass in -HostName must match an entry in "servers" below.
-    // =========================================================================
+    // -HostName must match a hostName in "servers" below.
 
 
     // -------- Networking that is the SAME for every server -------------------
@@ -35,8 +25,7 @@
         "vlanEnabled":    false,
         "vlanId":         0,
 
-        // Disable IPv6 on the CIMC management interface. Defaults to true
-        // (IPv6 off) if this field is omitted. Set to false to leave IPv6 as-is.
+        // true disables IPv6 on the CIMC management port. false leaves it unchanged.
         "disableIpv6":    true,
 
         // Olson timezone name, e.g. "America/Chicago", "Europe/London", "UTC".
@@ -46,29 +35,21 @@
 
     // -------- Intersight readiness -------------------------------------------
     "intersight": {
-        // Enable the CIMC Device Connector so the server is ready to claim
-        // in Intersight. Leave true unless you have a reason not to.
+        // true enables the Device Connector so the server can be claimed in Intersight.
         "enableDeviceConnector": true,
 
-        // If the CIMC must reach Intersight through a proxy, set these.
-        // Leave them as null if no proxy is needed.
+        // Set both only if CIMC must use a proxy to reach Intersight.
         "proxyHost":             null,
         "proxyPort":             null
     },
 
 
-    // -------- CIMC admin password handling -----------------------------------
-    //  The script only ever changes the CIMC admin password when the CIMC
-    //  is still at its factory default (CIMC forces a password change on
-    //  first login). At that moment the script will prompt you on screen
-    //  for the new password. If the CIMC is already configured with a
-    //  non-default password, the script will not touch the admin password
-    //  and there are no settings to tune here.
+    // The admin password is not stored here. The script prompts for the current
+    // password at startup. It asks for a new one only when CIMC is still at the
+    // factory default and forces a change.
 
 
-    // -------- Serial port settings -------------------------------------------
-    // Match these to your USB-to-serial adapter / console server. The Cisco
-    // CIMC defaults are 115200 / 8 / N / 1 with no flow control.
+    // -------- Serial port (CIMC default is 115200 / 8 / N / 1) ----------------
     "serial": {
         "baudRate":   115200,
         "parity":     "None",   // "None" | "Odd" | "Even"
@@ -84,55 +65,38 @@
         "loginTimeoutSec":     60,
         "interCommandDelayMs": 250,
 
-        // Reboot the host at the end so UEFI secure boot takes effect. When the
-        // firmware step is on, the HUU boot does this instead.
+        // Reboot the host at the end so secure boot takes effect.
+        // Ignored when the firmware step runs; the HUU boot is that reboot.
         "rebootWhenDone":      true
     },
 
 
-    // -------- Firmware upgrade via the Host Upgrade Utility (optional) -------
-    //  Serves the HUU ISO from this laptop and tells CIMC to update and
-    //  activate every component in that ISO. The window stays open until CIMC
-    //  reports the job finished. The laptop must stay on the CIMC management
-    //  network the whole time.
-    //
-    //  IMPORTANT: the CIMC reads vMedia over its MANAGEMENT IP network, NOT over
-    //  the serial cable. With transport "http-local" the script serves the ISO
-    //  from your laptop over HTTP, so the laptop must ALSO be on (or routable to)
-    //  the CIMC management network and its firewall must allow inbound on
-    //  servePort. If that isn't possible, host the ISO elsewhere and use
-    //  transport "url" with shareUrl instead.
-    //
-    //  serveHost auto-detects the laptop IP that is on the CIMC's subnet, so if
-    //  your Ethernet to the CIMC has a static IP in that subnet you can leave it
-    //  null. Set it explicitly only to override.
-    //
-    //  Enable per run with -Firmware on the command line, or set "enabled": true.
+    // -------- Firmware upgrade (optional) ------------------------------------
+    // Off unless "enabled" is true or you pass -Firmware.
+    // The laptop Ethernet must be on the CIMC subnet. CIMC pulls the ISO over
+    // that network, updates and activates every component, then boots the drive.
+    // Leave this window open until the log says the job finished.
     "firmware": {
         "enabled":        false,
 
-        // "http-local" = serve isoFolder from this laptop over HTTP.
-        // "url"        = the ISO is already hosted; use shareUrl below.
+        // "http-local" serves isoFolder from this laptop. "url" uses shareUrl.
         "transport":      "http-local",
 
-        // Folder on THIS laptop that holds the ISO, and the ISO file name.
+        // Folder on this laptop, and the ISO file name inside it.
         "isoFolder":      "/Users/you/Desktop/firmware",
         "isoFile":        "ucs-c220m7-huu.iso",
 
-        // Local HTTP server settings (transport "http-local").
-        //   serveHost: IP the CIMC should use to reach this laptop.
-        //              null = auto-detect the NIC on the CIMC subnet.
+        // null picks the laptop NIC that is on the CIMC subnet.
         "serveHost":      null,
         "servePort":      8000,
 
-        // Pre-hosted share (transport "url"): e.g. "http://10.10.10.9/iso/"
+        // Used when transport is "url". Example: "http://10.10.10.9/iso/"
         "shareUrl":       null,
         "shareUser":      null,
         "sharePassword":  null,
 
-        // vMedia + boot-order tuning (defaults suit CIMC 4.x/5.x/6.x).
-        // The script applies these together with rearrange-boot-device:
-        //   1 KVM mapped DVD, 2 CIMC mapped vDVD, 3 boot drive, UEFI shell last.
+        // Boot-device names. Used only if the automatic HUU job cannot start:
+        // KVM DVD, CIMC vDVD, boot drive, then UEFI shell.
         "vmediaVolume":   "firmware",
         "kvmBootName":    "KvmDvd",
         "kvmSubtype":     "KVMMAPPEDDVD",
@@ -143,35 +107,27 @@
         "uefiShellName":  "UefiShell",
         "uefiShellType":  "UEFISHELL",
 
-        // Power-cycle the server after setting the boot order so it boots the ISO.
-        // Used only if the automatic HUU job cannot be started.
+        // Power-cycle into the ISO only if the automatic HUU job cannot start.
         "powerCycle":     true,
 
-        // Non-interactive HUU. "all,hdd" updates and activates every component
-        // in the ISO, including drives. "all" skips drives. 30 to 240 minutes.
+        // "all,hdd" updates and activates every component, including drives.
+        // "all" skips drives. Timeout is 30 to 240 minutes.
+        // cimcSecureBoot installs the CIMC firmware in secure mode.
+        // Host UEFI secure boot is always enabled earlier in the run.
         "updateComponent":  "all,hdd",
         "updateTimeoutMin": 240,
         "cimcSecureBoot":   true
     },
 
 
-    // =========================================================================
-    //  PER-SERVER ENTRIES
-    //  -----------------------------------------------------------------------
-    //  Add one { ... } block per UCS server.
-    //
-    //  To add a new server, copy an existing block and change the values.
-    //  Remember: separate blocks with a comma, but the LAST block has no
-    //  trailing comma.
-    //
-    //  Fields:
-    //    hostName       required   used with -HostName on the command line
-    //    ipAddress      required   static IPv4 for the CIMC
-    //    primaryDns     required
-    //    secondaryDns   optional   use "" if you don't have one
-    //    dnsDomain      required   e.g. "example.lab"
-    //    ntpServers     required   list of 1-4 NTP servers
-    // =========================================================================
+    // One block per server. Copy a block to add one. Comma between blocks, not
+    // after the last block.
+    //   hostName      required   the -HostName value
+    //   ipAddress     required   CIMC IPv4
+    //   primaryDns    required
+    //   secondaryDns  optional   "" if unused
+    //   dnsDomain     required
+    //   ntpServers    required   1 to 4 servers
     "servers": [
 
         {

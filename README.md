@@ -1,11 +1,10 @@
 # UCS C-Series CIMC Configuration (Serial)
 
-PowerShell script that drives the CIMC CLI over the serial console to configure
-networking, DNS, NTP, hostname, NIC mode/redundancy, and to enable the
-Intersight Device Connector so the server is ready to claim in Intersight.
-Optionally it maps a firmware ISO (for example the Cisco HUU) as CIMC vMedia,
-puts that ISO first in the precision boot order (local LUN second), and
-power-cycles so the server boots the image.
+PowerShell script that drives the CIMC CLI over the serial console. It sets
+UEFI secure boot, networking, DNS, NTP, hostname, and the Intersight Device
+Connector. With the firmware step off, it reboots the host at the end so secure
+boot takes effect. With the firmware step on, it serves a Host Upgrade Utility
+ISO and has CIMC update and activate every component. That boot is the reboot.
 
 The script configures **one server at a time** over a single serial port. All
 editable values live in a single **JSONC** file (`cimc-config.jsonc`). JSONC is
@@ -14,7 +13,7 @@ JSON plus comments — open it in Notepad, VS Code, or any text editor.
 > **First time using this?** Start with **[`DEPLOYMENT_GUIDE.md`](./DEPLOYMENT_GUIDE.md)**.
 > It walks you through connecting the serial cable, identifying your serial port
 > (Windows/macOS/Linux), editing the JSON file, running the script, and the
-> optional firmware-ISO / vMedia step.
+> optional firmware upgrade.
 
 ## Files
 
@@ -22,26 +21,29 @@ JSON plus comments — open it in Notepad, VS Code, or any text editor.
 |-------------------------|---------------------------------------------------------------------------------------------|
 | `Configure-CIMC.ps1`    | The script. You do not need to open this to run a deployment.                               |
 | `cimc-config.jsonc`     | The only file you edit. Site settings, server inventory, optional firmware block.           |
-| `DEPLOYMENT_GUIDE.md`   | Step-by-step operator walkthrough (serial, config, Intersight claim, firmware ISO).         |
+| `DEPLOYMENT_GUIDE.md`   | Step-by-step operator walkthrough (serial, config, Intersight claim, firmware).             |
 | `logs/`                 | Timestamped session logs (auto-created on first run).                                       |
 
 ## What the script does on the connected server
 
-- Logs in over the serial console (handles the forced first-login password
-  change automatically when CIMC is at factory default, including waking a
-  parked serial console with ESC+9 after the CIMC applies the new password).
-- NIC mode (`dedicated` / `shared_lom*` / `cisco_card`) and redundancy.
-- Static IPv4 (address, subnet mask, gateway).
-- DNS (primary + optional secondary) and DNS domain.
-- Hostname (CIMC will also auto-regenerate its self-signed certificate with the
-  new hostname as CN — the script answers that prompt for you).
-- Optional IPv6 disable on the CIMC management interface (`site.disableIpv6`).
-- Up to 4 NTP servers + timezone (NTP service is enabled and committed before
-  the server addresses are loaded, so the entries actually take effect).
-- Optional VLAN tagging on the management port.
-- Enables the Intersight Device Connector (and proxy, if configured).
-- **Optional firmware step:** maps an ISO as CIMC-mapped vMedia, sets precision
-  boot order (mapped vDVD first, local LUN second), and power-cycles.
+In this order:
+
+1. Log in. On a factory-default CIMC, complete the forced password change.
+2. Enable UEFI secure boot. This also selects UEFI mode and applies on the next reboot.
+3. Set NIC mode, static IPv4, DNS, hostname, and DNS domain. A hostname change
+   regenerates the CIMC certificate. The script answers that prompt.
+4. Enable NTP, then load up to four NTP servers and the timezone.
+5. Enable the Intersight Device Connector, and a proxy if one is configured.
+6. Reboot the host so secure boot takes effect. If `firmware.enabled` is true,
+   or you pass `-Firmware`, skip that reboot and run the HUU upgrade instead.
+   CIMC mounts the ISO, updates and activates every component, then the script
+   puts the boot drive first. If the automatic job cannot start, the script
+   maps the ISO and boots it so you can choose Update and Activate on the HUU screen.
+
+`site.disableIpv6` turns IPv6 off on the management port. `site.vlanEnabled`
+tags that port. Set `behavior.rebootWhenDone` to `false` to skip the end reboot
+when you are not running the firmware step. Secure boot still will not apply
+until something reboots the host.
 
 The script **only changes the CIMC admin password** when the CIMC is still at
 its factory default and CIMC itself forces a change at first login. On a CIMC
@@ -55,12 +57,11 @@ password and never changes it.
   / **CONSOLE** jack on most C-Series).
 - Serial settings: `115200 / 8 / N / 1`, no flow control. These are CIMC
   factory defaults and are also the JSON file's defaults.
-- For the optional firmware / vMedia step:
-  - Ethernet from the laptop to the CIMC management port (the CIMC reads
-    vMedia over IP, not over serial).
-  - A static IPv4 on that laptop Ethernet NIC in the CIMC's subnet.
-  - Python 3 on the laptop when `firmware.transport` is `"http-local"` (used
-    to serve the ISO folder).
+- For the optional firmware step:
+  - Ethernet from the laptop to the CIMC management port. CIMC reads the ISO
+    over that network, not over serial.
+  - A static IPv4 on that Ethernet NIC in the CIMC subnet.
+  - Python 3 when `firmware.transport` is `"http-local"`.
 
 ## Editing `cimc-config.jsonc`
 
@@ -116,24 +117,17 @@ macOS / Linux:
 pwsh -NoProfile -File ./Configure-CIMC.ps1 -ComPort /dev/cu.usbserial-10 -HostName rack01-ucs01
 ```
 
-## Firmware upgrade via CIMC-mapped vMedia (optional)
+## Firmware upgrade (optional)
 
-Enable with `-Firmware` on the command line, or set `"firmware"."enabled"` to
-`true` in `cimc-config.jsonc`. The ISO lives in a folder you choose
-(`firmware.isoFolder` / `-IsoFolder` plus `firmware.isoFile` / `-IsoFile`).
+Turn it on with `-Firmware`, or set `"firmware"."enabled"` to `true`. The ISO
+is `firmware.isoFolder` / `-IsoFolder` plus `firmware.isoFile` / `-IsoFile`.
 
-The CIMC pulls the ISO over its **management IP**, not the serial cable. Typical
-rack workflow:
-
-1. Serial console for configuration.
-2. Ethernet from the laptop to the CIMC management port.
-3. Static IPv4 on that Ethernet NIC in the CIMC subnet (same mask as `site`).
-4. Allow inbound on `firmware.servePort` (default `8000`) in the laptop firewall.
-
-The script auto-selects the laptop IPv4 that is on the CIMC subnet as
-`serveHost` (override with `firmware.serveHost` if needed). With
-`"transport": "http-local"` it serves the folder over HTTP; with `"url"` it
-maps a pre-hosted `shareUrl` instead.
+CIMC pulls the ISO over its management IP. Use the serial cable for the script
+and an Ethernet cable from the laptop to the CIMC management port. Give that
+Ethernet NIC a static IPv4 in the CIMC subnet, and allow inbound TCP
+`firmware.servePort` (default `8000`). Leave `serveHost` null unless you need
+to override the auto-detected address. `"http-local"` serves the folder from
+the laptop. `"url"` uses a pre-hosted `shareUrl`.
 
 ```powershell
 .\Configure-CIMC.ps1 -ComPort COM3 -HostName rack01-ucs01 -Firmware -IsoFolder C:\firmware -IsoFile ucs-c220m7-huu.iso
@@ -144,14 +138,15 @@ pwsh -NoProfile -File ./Configure-CIMC.ps1 -ComPort /dev/cu.usbserial-10 -HostNa
     -Firmware -IsoFolder ~/Desktop/firmware -IsoFile ucs-c220m7-huu.iso
 ```
 
-After mapping and the power cycle, **leave the script running** until the
-firmware update finishes — the local HTTP server must stay up while the CIMC
-reads the media. Press Enter in the script only when you are done.
+Leave the window open until the log says the job finished. The HTTP server
+stops after that. `updateComponent` defaults to `all,hdd` (every component,
+including drives). Use `all` to skip drives. A full run often takes one to
+three hours.
 
-vMedia subtype, local LUN boot type, and power-cycle command tokens can vary by
-CIMC firmware. Tune `vmediaSubtype`, `localBootType`, and related fields in the
-`"firmware"` block if the session log shows a rejection. Full operator steps are
-in [`DEPLOYMENT_GUIDE.md`](./DEPLOYMENT_GUIDE.md).
+If CIMC rejects the automatic job, the script maps the ISO, sets the boot order
+to KVM DVD, CIMC vDVD, the boot drive, then the UEFI shell, and power-cycles.
+Finish Update and Activate on the HUU screen, then press Enter in the script.
+Operator steps are in [`DEPLOYMENT_GUIDE.md`](./DEPLOYMENT_GUIDE.md).
 
 ## Credentials are never stored in the file
 
@@ -183,8 +178,8 @@ UCS Standalone**.
 | `COM port 'COMx' not found`                                   | Check Device Manager for the adapter's COM number.                    |
 | `Timeout waiting for pattern(s): login:`                      | Baud rate / wiring / wrong physical port (use the rear console jack). After a factory reset, wait — CIMC boot can take several minutes. |
 | Script appears stuck at "Probing CIMC prompt..."              | Another app (PuTTY / SecureCRT / Tera Term / `screen`) has the serial port open, or CIMC is still booting. |
-| vMedia mapping did not report `Map-Status: OK`                | Laptop Ethernet not on the CIMC subnet, firewall blocking `servePort`, ISO path/name wrong, or `python3` HTTP server not running. |
-| `create-boot-device` / `set subtype` / `power cycle` rejected | CIMC firmware uses different CLI tokens — adjust `vmediaSubtype` / `localBootType` in the `"firmware"` block and retry. |
+| HUU job does not start, or the ISO never downloads           | Laptop Ethernet is not on the CIMC subnet, the firewall blocks `servePort`, the ISO name is wrong, or Python is not installed. |
+| `create-boot-device` / `set subtype` / `power cycle` rejected | Automatic HUU did not start, and a fallback boot token was rejected. Adjust the names in the `"firmware"` block and retry. |
 | `Authentication failed with both supplied and factory-default passwords` | Someone has changed the CIMC password and the value typed at the prompt is wrong. |
 | `Invalid scope` on `scope cloud` / `scope device-connector`   | Very old CIMC firmware — upgrade it and retry.                        |
 | `active-active` rejected                                      | Only valid with a `shared_lom*` NIC mode. Use `none` with `dedicated`. |

@@ -23,7 +23,7 @@ Keep an inventory of every server you'll eventually configure in
 7. [Step 5 — Edit `cimc-config.jsonc`](#step-5--edit-cimc-configjsonc)
 8. [Step 6 — Run the script](#step-6--run-the-script)
 9. [Step 7 — Claim the server in Intersight](#step-7--claim-the-server-in-intersight)
-10. [Optional — Boot a firmware ISO (HUU) via vMedia](#optional--boot-a-firmware-iso-huu-via-vmedia)
+10. [Optional — Firmware upgrade (HUU)](#optional--firmware-upgrade-huu)
 11. [Troubleshooting](#troubleshooting)
 12. [Glossary](#glossary)
 
@@ -48,9 +48,11 @@ You'll do that by:
    for you — including the mandatory first-login password change on a
    factory-default CIMC.
 
-When the script finishes, the CIMC is reachable on its new IP address. You then
-open the CIMC web UI in a browser and copy the Device ID and Claim Code to
-register the server with Intersight.
+When the script finishes, the CIMC is reachable on its new IP address and UEFI
+secure boot is enabled. The host reboots at the end so that takes effect. You
+then open the CIMC web UI and copy the Device ID and Claim Code to register the
+server with Intersight. If the firmware step is on, the Host Upgrade Utility
+boot is that reboot, and the script waits until the upgrade finishes.
 
 ---
 
@@ -293,9 +295,13 @@ Timeouts. The defaults are fine for most environments.
 "behavior": {
     "commandTimeoutSec":   20,
     "loginTimeoutSec":     60,
-    "interCommandDelayMs": 250
+    "interCommandDelayMs": 250,
+    "rebootWhenDone":      true    // reboot at the end so secure boot takes effect
 }
 ```
+
+`rebootWhenDone` is ignored when the firmware step runs. The HUU boot is the
+reboot in that case. Set it to `false` only if you will reboot the host yourself.
 
 #### 5e. The `"servers"` list — one entry per server
 
@@ -440,9 +446,9 @@ logs back in with the new password to finish the configuration.
 ### What you'll see while it runs
 
 Lines starting with `->` are commands the script sent to CIMC; password lines
-show `<redacted>`. A normal run on an already-booted CIMC finishes within a
-minute or two (longer if it's waiting out a post-reset boot), ending with
-something like:
+show `<redacted>`. A configuration run on an already-booted CIMC finishes
+within a few minutes, then reboots the host. A firmware run stays open for the
+whole upgrade, often one to three hours. Either way it ends with something like:
 
 ```
 Done. Log: .../logs/cimc-session-20260610-102651.log
@@ -470,20 +476,25 @@ UI now that the CIMC has its new IP:
 Within a minute or two the server appears under **Operate → Servers** in
 Intersight.
 
-You can now unplug the serial cable and move to the next server.
+You can now unplug the serial cable and move to the next server. If this run
+included the firmware step, wait until that job finishes before you unplug.
 
 ---
 
-## Optional — Boot a firmware ISO (HUU) via vMedia
+## Optional — Firmware upgrade (HUU)
 
-The script can also point the server at a firmware ISO (for example, the Cisco
-**HUU** — Host Upgrade Utility) by mapping it as CIMC virtual media and putting
-it first in the boot order (local LUN second), then power-cycling so the server
-boots the ISO. You then complete the firmware update from the HUU screen (over
-the CIMC KVM or console) — the script's job is to get the server booted to the
-ISO.
+With the firmware step on, the script serves a Cisco Host Upgrade Utility ISO
+and tells CIMC to update and activate every component in it, including drives.
+CIMC boots the ISO itself. You do not drive the HUU screen. Leave the script
+window open until the log says the job finished. That boot applies the UEFI
+secure boot setting from earlier in the run, so the script does not reboot
+again at the end.
 
-### How the CIMC reaches the ISO (read this first)
+If CIMC rejects the automatic job, the script maps the ISO, sets the boot order
+(KVM DVD, CIMC vDVD, boot drive, UEFI shell), and power-cycles. Finish
+**Update and Activate** on the HUU screen, then press Enter in the script.
+
+### Network setup
 
 The CIMC reads virtual media over its **management IP network — not over the
 serial cable.** So an ISO "on your laptop" has to be served over IP, and the
@@ -517,23 +528,24 @@ Put the ISO in a folder on your laptop, then edit the `"firmware"` block in
 
 ```jsonc
 "firmware": {
-    "enabled":        false,            // or pass -Firmware on the command line
-    "transport":      "http-local",     // "http-local" serves from your laptop; "url" uses a hosted share
-    "isoFolder":      "/Users/you/Desktop/firmware",
-    "isoFile":        "ucs-c220m7-huu.iso",
-    "serveHost":      null,              // null = auto-detect the NIC on the CIMC subnet
-    "servePort":      8000,
-    "shareUrl":       null,              // for transport "url", e.g. "http://10.10.10.9/iso/"
-    "shareUser":      null,
-    "sharePassword":  null,
-    "vmediaVolume":   "firmware",
-    "vmediaSubtype":  "CIMCMAPPEDDVD",   // CIMC-mapped vDVD subtype
-    "dvdBootName":    "vDVD",            // boot device #1
-    "localBootName":  "LocalLUN",        // boot device #2
-    "localBootType":  "LOCALHDD",
-    "powerCycle":     true               // power-cycle to boot the ISO
+    "enabled":           false,          // or pass -Firmware on the command line
+    "transport":         "http-local",   // "url" uses shareUrl instead
+    "isoFolder":         "/Users/you/Desktop/firmware",
+    "isoFile":           "ucs-c220m7-huu.iso",
+    "serveHost":         null,           // null = NIC on the CIMC subnet
+    "servePort":         8000,
+    "shareUrl":          null,
+    "shareUser":         null,
+    "sharePassword":     null,
+    "updateComponent":   "all,hdd",      // "all" skips drives
+    "updateTimeoutMin":  240,
+    "cimcSecureBoot":    true
 }
 ```
+
+`http-local` needs Python 3 on the laptop. The other firmware fields are boot-device
+names used only if the automatic job cannot start. Leave them at the defaults
+unless the log shows CIMC rejected one.
 
 ### Run it
 
@@ -552,17 +564,12 @@ On Windows:
 .\Configure-CIMC.ps1 -ComPort COM3 -HostName rack01-ucs01 -Firmware -IsoFolder C:\firmware -IsoFile ucs-c220m7-huu.iso
 ```
 
-The script maps the ISO, verifies the mapping status, sets the boot order,
-power-cycles the server, and then **keeps the local HTTP server running** while
-the CIMC reads the media. **Leave the script window open** until the firmware
-update is finished — press **Enter** in the script only when you're done, which
-stops serving the ISO.
+The script keeps the HTTP server running while CIMC reads the ISO. Leave the
+window open. It stops the server when CIMC reports the job finished, then puts
+the boot drive first. A component failure is written in the log under `logs/`.
 
-> **Note:** the exact CIMC CLI tokens for the vMedia boot subtype, the local
-> LUN device type, and the power-cycle command can vary by firmware version. If
-> the log shows one of these was rejected, adjust `vmediaSubtype`,
-> `localBootType`, etc. in the `"firmware"` block and re-run. The session log
-> under `logs/` records exactly what the CIMC returned.
+Changing the CIMC IP or hostname restarts its web interface. The script waits
+for that interface before it starts the upgrade.
 
 ---
 
@@ -653,3 +660,7 @@ start over.
   addresses.
 - **JSONC** — JSON with comments. A forgiving version of JSON you can add `//`
   notes to.
+- **HUU** — Host Upgrade Utility. The Cisco ISO that updates and activates
+  server firmware.
+- **UEFI secure boot** — a BIOS setting that only boots signed software. The
+  script turns it on at the start. It applies on the next reboot.
