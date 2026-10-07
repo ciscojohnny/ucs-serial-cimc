@@ -12,7 +12,8 @@
         3. Enable NTP, load the NTP servers, and set the timezone.
         4. Enable the Intersight Device Connector.
         5. If firmware.enabled is true (or -Firmware is passed), serve the HUU
-           ISO and have CIMC update and activate every component. CIMC boots
+           ISO and have CIMC update and activate every component except the
+           drives. CIMC boots
            the ISO as part of that job.
 
 .NOTES
@@ -2091,8 +2092,8 @@ function New-CimcHuuTriggerBody {
 
 function Invoke-CimcHuuUpgrade {
     # Ask CIMC to boot the HUU ISO and run its non-interactive update.
-    # updateComponent "all,hdd" is Cisco's token for every component the ISO
-    # contains, including drives. The same job updates and activates them.
+    # "all" updates and activates every component except drives. "all,hdd"
+    # includes drives. Leave drives out when a hypervisor install owns the disks.
     param(
         [Parameter(Mandatory)][string]$CimcIp,
         [Parameter(Mandatory)][string]$RemoteIp,
@@ -2103,7 +2104,7 @@ function Invoke-CimcHuuUpgrade {
         [string]$MapRetryShare,
         [Parameter(Mandatory)][object]$Fw
     )
-    $component = if ($Fw.updateComponent) { [string]$Fw.updateComponent } else { 'all,hdd' }
+    $component = if ($Fw.updateComponent) { [string]$Fw.updateComponent } else { 'all' }
     $timeoutMin = if ($Fw.updateTimeoutMin) { [int]$Fw.updateTimeoutMin } else { 240 }
     if ($timeoutMin -lt 30) { $timeoutMin = 30 }
     if ($timeoutMin -gt 240) { $timeoutMin = 240 }
@@ -2120,7 +2121,7 @@ function Invoke-CimcHuuUpgrade {
         -ShareUser $ShareUser -SharePass $SharePass -Component $component -TimeoutMin $timeoutMin
     Write-Log "Starting HUU update and activate for '$component' from $RemoteIp$RemoteShare. CIMC allows up to $timeoutMin minutes. Leave this window open."
     Write-Host ''
-    Write-Host "HUU is updating and activating every component. This often takes one to three hours." -ForegroundColor Yellow
+    Write-Host "HUU is updating and activating every component except the drives. This often takes one to three hours." -ForegroundColor Yellow
     Write-Host "The ISO stays available from this laptop until CIMC reports the job finished." -ForegroundColor Yellow
     $trigger = Send-CimcXmlRequest -CimcIp $CimcIp -Body $body -TimeoutSec 180
     if ($trigger -match 'errorCode="([^"]+)"' -and $Matches[1]) {

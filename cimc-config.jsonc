@@ -70,7 +70,7 @@
     // -------- Firmware upgrade (optional) ------------------------------------
     // Off unless "enabled" is true or you pass -Firmware.
     // The laptop Ethernet must be on the CIMC subnet. CIMC pulls the ISO over
-    // that network, updates and activates every component, then boots the drive.
+    // that network, updates and activates every component except the drives, then boots the drive.
     // Leave this window open until the log says the job finished.
     "firmware": {
         "enabled":        false,
@@ -106,9 +106,9 @@
         // Power-cycle into the ISO only if the automatic HUU job cannot start.
         "powerCycle":     true,
 
-        // "all,hdd" updates and activates every component, including drives.
-        // "all" skips drives. Timeout is 30 to 240 minutes.
-        "updateComponent":  "all,hdd",
+        // "all" updates and activates every component except drives.
+        // "all,hdd" includes drives. Timeout is 30 to 240 minutes.
+        "updateComponent":  "all",
         "updateTimeoutMin": 240
     },
 

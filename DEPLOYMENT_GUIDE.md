@@ -479,7 +479,7 @@ included the firmware step, wait until that job finishes before you unplug.
 ## Optional — Firmware upgrade (HUU)
 
 With the firmware step on, the script serves a Cisco Host Upgrade Utility ISO
-and tells CIMC to update and activate every component in it, including drives.
+and tells CIMC to update and activate every component in it except the drives.
 CIMC boots the ISO itself. You do not drive the HUU screen. Leave the script
 window open until the log says the job finished. A configuration-only run does
 not reboot the host.
@@ -531,7 +531,7 @@ Put the ISO in a folder on your laptop, then edit the `"firmware"` block in
     "shareUrl":          null,
     "shareUser":         null,
     "sharePassword":     null,
-    "updateComponent":   "all,hdd",      // "all" skips drives
+    "updateComponent":   "all",          // "all,hdd" includes drives
     "updateTimeoutMin":  240
 }
 ```

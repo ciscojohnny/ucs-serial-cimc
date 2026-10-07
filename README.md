@@ -135,8 +135,9 @@ pwsh -NoProfile -File ./Configure-CIMC.ps1 -ComPort /dev/cu.usbserial-10 -HostNa
 ```
 
 Leave the window open until the log says the job finished. The HTTP server
-stops after that. `updateComponent` defaults to `all,hdd` (every component,
-including drives). Use `all` to skip drives. A full run often takes one to
+stops after that. `updateComponent` defaults to `all` (every component
+except the drives). Use `all,hdd` only when the drives should be updated too.
+A full run often takes one to
 three hours.
 
 If CIMC rejects the automatic job, the script maps the ISO, sets the boot order
