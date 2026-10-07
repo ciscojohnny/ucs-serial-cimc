@@ -1780,13 +1780,32 @@ function Invoke-FirmwareUpgrade {
             throw "Unknown firmware.transport '$transport' (expected 'http-local' or 'url')."
         }
 
-        Set-CimcVmediaBootOrder -Port $SerialPort -Config $Config -Fw $fw
-        if ($powerCyc) { Invoke-CimcPowerCycle -Port $SerialPort -Config $Config }
+        # map-www can return to /vmedia # and then stop reading the serial port
+        # while CIMC finishes the mount. Losing the next command must not stop
+        # the ISO server: the mapping is already saved.
+        $bootOrderSet = $false
+        try {
+            if (-not (Sync-CimcPrompt -Port $SerialPort -Attempts 3 -TimeoutSec 5)) {
+                throw "The serial console did not return a prompt after the ISO was mapped."
+            }
+            Set-CimcVmediaBootOrder -Port $SerialPort -Config $Config -Fw $fw
+            if ($powerCyc) { Invoke-CimcPowerCycle -Port $SerialPort -Config $Config }
+            $bootOrderSet = $true
+        }
+        catch {
+            Write-Log -Level WARN "ISO is mapped, but the boot order was not changed: $($_.Exception.Message)"
+        }
 
         if ($server) {
             Write-Host ''
-            Write-Host "ISO is mapped and the server is booting to it. The local HTTP server must stay running" -ForegroundColor Yellow
-            Write-Host "while the CIMC reads the media (this can take a long time for a firmware update)." -ForegroundColor Yellow
+            if ($bootOrderSet) {
+                Write-Host "ISO is mapped and the server is booting to it. The local HTTP server must stay running" -ForegroundColor Yellow
+                Write-Host "while the CIMC reads the media (this can take a long time for a firmware update)." -ForegroundColor Yellow
+            } else {
+                Write-Host "The ISO is mapped. The serial console stopped answering, so the boot order was not changed." -ForegroundColor Yellow
+                Write-Host "In CIMC, put the mapped vDVD first and the local disk second, then power-cycle the server." -ForegroundColor Yellow
+                Write-Host "The local HTTP server must stay running while the CIMC reads the ISO." -ForegroundColor Yellow
+            }
             Write-Host "Press Enter here ONLY when the upgrade is complete to stop serving the ISO..." -ForegroundColor Yellow
             [void](Read-Host)
         }
