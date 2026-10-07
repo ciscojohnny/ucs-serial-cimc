@@ -68,7 +68,7 @@ This script talks to standalone CIMC, not UCS Manager. It is tested on a C220 M7
 | --- | --- | --- |
 | Timezone | `timezone-select`. The US list says `Central Time`. | Same command. Older menus say `Central (most areas)`. |
 | HUU / vMedia location | One location: `remoteIp` is `http://host:port` and `remoteShare` is `/file.iso`. | Remote share and remote file stay separate. The share is `http://host:port/` and the file is the ISO name. The HUU object rejects `remoteFile`. |
-| Boot into that ISO | The HUU job boots the ISO itself. | After the vMedia map, the CIMC-mapped DVD is set first and the host is power-cycled over HTTPS. |
+| Boot into that ISO | The HUU job boots the ISO, accepts the license, and updates. | After the vMedia map, a delayed non-interactive update is armed, the CIMC-mapped DVD is set first, and the host is power-cycled. The ISO accepts the license and updates. |
 | Drives | `updateComponent` `all` skips drives. | Same token. `all,hdd` is the only value that includes drives. |
 
 An empty precision boot list is normal. The script leaves the BIOS default order in place. It does not enable UEFI secure boot, and a configuration-only run does not reboot the host.
