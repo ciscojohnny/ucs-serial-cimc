@@ -1575,31 +1575,45 @@ function Set-CimcVmediaMap {
         throw "CIMC did not return to a prompt after map-www. It may be unable to reach $BaseUrl from the CIMC management IP. Allow Python through Windows Firewall on the laptop Ethernet NIC that faces the CIMC."
     }
 
-    try {
-        # "show mappings" is the IMC 6.0 status table. "show mappings detail"
-        # on this server produced no bytes for two minutes and never opened the URL.
-        $status = Send-Command -Port $Port -Command 'show mappings' `
-            -ExpectPatterns @($script:RxCli) -TimeoutSec 45 -InterDelayMs $delayMs
-        Write-CimcTail -Text $status
-    }
-    catch {
-        $why = $_.Exception.Message
-        Write-Log -Level WARN $why
-        Write-Host ''
-        Write-Host "map-www was accepted, but 'show mappings' did not return. The ISO server is still running." -ForegroundColor Yellow
-        Write-Host "In CIMC, open Compute > Remote Presence > Virtual Media. The share and filename are two fields; the URL is ${BaseUrl}${IsoFile}." -ForegroundColor Yellow
-        Write-Host "An HTTP line in this window from the CIMC address means the mount reached the laptop. A line from this laptop is only the local check." -ForegroundColor Yellow
-        Write-Host 'Press Enter to stop the server...' -ForegroundColor Yellow
-        [void](Read-Host)
-        throw "map-www returned to the prompt, but 'show mappings' did not finish. CIMC did not open ${BaseUrl}${IsoFile}. $why"
-    }
-
-    if ($status -match '(?i)Map-Status\s*:\s*OK' -or $status -match "(?i)$([regex]::Escape($Volume))\s+OK") {
-        Write-Log "vMedia mapping '$Volume' reported Map-Status OK."
+    # Do not run "show mappings" here. On this CIMC it probes the ISO and then
+    # never returns the serial prompt, even after the mapping is visible and
+    # healthy in the CIMC UI. map-www has already returned to /vmedia #, so the
+    # boot-order commands can run. Watch the HTTP log for the CIMC address.
+    $serveIp = ''
+    if ($BaseUrl -match '^https?://([^/:]+)') { $serveIp = $Matches[1] }
+    $cimcClient = Wait-CimcHttpClient -LogPath $script:SessionLog -LaptopAddresses @('127.0.0.1', $serveIp) -TimeoutSec 3
+    if ($cimcClient) {
+        Write-Log "CIMC address $($cimcClient -join ', ') reached the ISO. Mapping '$Volume' is accepted; continuing without 'show mappings'."
     } else {
-        throw "vMedia volume '$Volume' is not Map-Status OK, so the server will not be power-cycled. CIMC did not mount ${BaseUrl}${IsoFile}. An 'HTTP:' line from the CIMC address means the laptop received the request; no such line means the CIMC never connected."
+        Write-Log "map-www accepted volume '$Volume'. No CIMC HTTP request yet; the CIMC may open ${BaseUrl}${IsoFile} when the host boots. Continuing without 'show mappings'."
     }
-    return $status
+    return "map-www accepted $Volume"
+}
+
+function Wait-CimcHttpClient {
+    # HTTP events are written by another PowerShell runspace, so the session
+    # log is the handoff. Ignore the laptop's own preflight requests.
+    param(
+        [Parameter(Mandatory)][string]$LogPath,
+        [string[]]$LaptopAddresses,
+        [int]$TimeoutSec = 10
+    )
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $found = @{}
+    while ($sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
+        if (Test-Path -LiteralPath $LogPath) {
+            $lines = @(Select-String -LiteralPath $LogPath -Pattern 'HTTP: (\d+\.\d+\.\d+\.\d+) -' -ErrorAction SilentlyContinue)
+            foreach ($line in $lines) {
+                foreach ($match in $line.Matches) {
+                    $ip = $match.Groups[1].Value
+                    if ($LaptopAddresses -notcontains $ip) { $found[$ip] = $true }
+                }
+            }
+        }
+        if ($found.Count -gt 0) { return @($found.Keys) }
+        Start-Sleep -Milliseconds 250
+    }
+    return @()
 }
 
 function Set-CimcVmediaBootOrder {
