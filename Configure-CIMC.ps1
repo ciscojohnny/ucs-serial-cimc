@@ -51,10 +51,11 @@ param(
 
     [string]$LogDirectory = (Join-Path $PSScriptRoot 'logs'),
 
-    # Firmware upgrade via CIMC-mapped vMedia. When present, forces the firmware
-    # step on for this run (overrides "firmware".enabled=false in the config).
-    # The ISO is served from a local folder over HTTP and the CIMC is set to
-    # boot from the mapped vDVD first, then the local LUN.
+    # Firmware upgrade with the Host Upgrade Utility. When present, forces the
+    # firmware step on for this run (overrides "firmware".enabled=false in the
+    # config). The ISO is served from a local folder over HTTP and CIMC runs
+    # the HUU update and activate for every component. Without the firmware
+    # step, the host is rebooted at the end instead.
     [switch]$Firmware,
 
     # Optional per-run overrides for the firmware step (otherwise taken from the
@@ -1003,8 +1004,8 @@ function Enable-IntersightDeviceConnector {
 # The CIMC reads virtual media over its OWN management IP network (NOT over the
 # serial cable). So to boot an ISO that lives "on the laptop", the laptop must
 # run a web server that the CIMC's configured IP can reach, and we map the ISO
-# with `scope vmedia` / `map-www`. We then set the precision boot order so the
-# CIMC boots the mapped vDVD first and the local LUN second, and power-cycle.
+# with `scope vmedia` / `map-www` only if the non-interactive HUU job cannot be
+# started. Normally CIMC mounts and boots the ISO itself for that job.
 
 function Get-LocalIPv4Addresses {
     # All usable local IPv4 addresses (skips loopback and link-local).
@@ -1951,7 +1952,7 @@ function Invoke-CimcHuuUpgrade {
 
     Write-Log "Signing in to CIMC at https://$CimcIp/ to start the HUU update."
     $script:HuuJobStarted = $false
-    $cookie = Connect-CimcXml -CimcIp $CimcIp
+    $cookie = Wait-CimcXmlReady -CimcIp $CimcIp
     $prior = Get-CimcHuuStatus -CimcIp $CimcIp -Cookie $cookie
     $oldEnd = [string]$prior.EndTime
     $oldStart = [string]$prior.StartTime
@@ -2055,15 +2056,7 @@ function Repair-CimcBootAfterHuu {
         if (-not (Sync-CimcPrompt -Port $Port -Attempts 3 -TimeoutSec 5)) {
             Invoke-CimcLogin -Port $Port -Behavior $Config.behavior
         }
-        Send-Command -Port $Port -Command 'top' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-        Send-Command -Port $Port -Command 'scope vmedia' -ExpectPatterns @('#\s*$','Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-        $unmap = Send-Command -Port $Port -Command "unmap $volume" `
-            -ExpectPatterns @($script:RxCli, "(?i)enter 'yes' or 'no'", '(?i)does not exist', '(?i)not found', '(?i)invalid') `
-            -TimeoutSec $cmdTO -InterDelayMs $delayMs
-        if ($unmap -match "(?i)enter 'yes' or 'no'" -and $unmap -notmatch $script:RxCli) {
-            Send-Command -Port $Port -Command 'no' -ExpectPatterns @($script:RxCli, '(?i)invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-        }
-        Send-Command -Port $Port -Command 'top' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+        Remove-CimcVmediaMap -Port $Port -Config $Config -Volume $volume
         Send-Command -Port $Port -Command 'scope bios' -ExpectPatterns @('#\s*$','Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
         $listed = Send-Command -Port $Port -Command 'show boot-device' -ExpectPatterns @('#\s*$') -TimeoutSec $cmdTO -InterDelayMs $delayMs
         $known = @(Get-CimcBootDeviceNames -Text $listed)
@@ -2087,20 +2080,96 @@ function Repair-CimcBootAfterHuu {
     }
 }
 
+function Remove-CimcVmediaMap {
+    param(
+        [Parameter(Mandatory)][System.IO.Ports.SerialPort]$Port,
+        [Parameter(Mandatory)][object]$Config,
+        [Parameter(Mandatory)][string]$Volume
+    )
+    $cmdTO   = [int]$Config.behavior.commandTimeoutSec
+    $delayMs = [int]$Config.behavior.interCommandDelayMs
+    Send-Command -Port $Port -Command 'top' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+    Send-Command -Port $Port -Command 'scope vmedia' -ExpectPatterns @('#\s*$','Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+    $unmap = Send-Command -Port $Port -Command "unmap $Volume" `
+        -ExpectPatterns @($script:RxCli, "(?i)enter 'yes' or 'no'", '(?i)does not exist', '(?i)not found', '(?i)invalid') `
+        -TimeoutSec $cmdTO -InterDelayMs $delayMs
+    if ($unmap -match "(?i)enter 'yes' or 'no'" -and $unmap -notmatch $script:RxCli) {
+        Send-Command -Port $Port -Command 'no' -ExpectPatterns @($script:RxCli, '(?i)invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+    }
+    Send-Command -Port $Port -Command 'top' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+}
+
+function Invoke-CimcHostReboot {
+    # Reboot the host so the BIOS settings (secure boot, boot order) take
+    # effect. A host that is off is powered on instead, because 'power cycle'
+    # is refused on a powered-off host.
+    param(
+        [Parameter(Mandatory)][System.IO.Ports.SerialPort]$Port,
+        [Parameter(Mandatory)][object]$Config,
+        [string]$Reason = 'apply the new settings',
+        [switch]$OnlyIfOff
+    )
+    $cmdTO   = [int]$Config.behavior.commandTimeoutSec
+    $delayMs = [int]$Config.behavior.interCommandDelayMs
+    Send-Command -Port $Port -Command 'top' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+    Send-Command -Port $Port -Command 'scope chassis' -ExpectPatterns @('#\s*$','Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+    $detail = Send-Command -Port $Port -Command 'show detail' -ExpectPatterns @('#\s*$') -TimeoutSec $cmdTO -InterDelayMs $delayMs
+    $state = ''
+    $m = [regex]::Match($detail, '(?im)^\s*Power(?:\s+State)?\s*:\s*(on|off)\b')
+    if ($m.Success) { $state = $m.Groups[1].Value.ToLower() }
+
+    if ($state -eq 'off') {
+        Write-Log "Host is powered off. Powering it on to $Reason."
+        $resp = Send-CimcConfirm -Port $Port -Command 'power on' -TimeoutSec $cmdTO -InterDelayMs $delayMs
+    }
+    elseif ($OnlyIfOff) {
+        Write-Log 'Host is already powered on.'
+        Send-Command -Port $Port -Command 'top' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+        return
+    }
+    else {
+        Write-Log "Power-cycling the host to $Reason."
+        $resp = Send-CimcConfirm -Port $Port -Command 'power cycle' -TimeoutSec $cmdTO -InterDelayMs $delayMs
+        if ($resp -match '(?i)powered off|is off|not powered') {
+            Write-Log 'CIMC reports the host is off. Powering it on.'
+            $resp = Send-CimcConfirm -Port $Port -Command 'power on' -TimeoutSec $cmdTO -InterDelayMs $delayMs
+        }
+    }
+    if ($resp -match '(?i)invalid') {
+        Write-Log -Level WARN "CIMC rejected the power command. Reboot the server from the CIMC UI to $Reason."
+    }
+    Send-Command -Port $Port -Command 'top' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+}
+
 function Invoke-CimcPowerCycle {
     param(
         [Parameter(Mandatory)][System.IO.Ports.SerialPort]$Port,
         [Parameter(Mandatory)][object]$Config
     )
-    $cmdTO   = [int]$Config.behavior.commandTimeoutSec
-    $delayMs = [int]$Config.behavior.interCommandDelayMs
-    Write-Log 'Power-cycling the server to boot the mapped ISO.'
-    Send-Command -Port $Port -Command 'top' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-    Send-Command -Port $Port -Command 'scope chassis' -ExpectPatterns @('#\s*$','Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-    $resp = Send-CimcConfirm -Port $Port -Command 'power cycle' -TimeoutSec $cmdTO -InterDelayMs $delayMs
-    if ($resp -match 'Invalid') {
-        Write-Log -Level WARN "'power cycle' was rejected under scope chassis on this firmware; power-cycle the server manually to boot the ISO."
+    Invoke-CimcHostReboot -Port $Port -Config $Config -Reason 'boot the mapped ISO'
+}
+
+function Wait-CimcXmlReady {
+    # A network or hostname commit restarts the CIMC web server and can
+    # regenerate its certificate. Wait for the XML API before sending the HUU job.
+    param(
+        [Parameter(Mandatory)][string]$CimcIp,
+        [int]$TimeoutSec = 600
+    )
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $lastWhy = ''
+    while ($sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
+        try {
+            return (Connect-CimcXml -CimcIp $CimcIp)
+        }
+        catch {
+            $lastWhy = $_.Exception.Message
+            if ($lastWhy -match '(?i)login failed') { throw }
+            Write-Log ("CIMC HTTPS at {0} is not ready yet ({1}s). Retrying." -f $CimcIp, [int]$sw.Elapsed.TotalSeconds)
+            Start-Sleep -Seconds 15
+        }
     }
+    throw "CIMC HTTPS at $CimcIp did not answer within ${TimeoutSec}s: $lastWhy"
 }
 
 function Invoke-FirmwareUpgrade {
@@ -2201,6 +2270,10 @@ function Invoke-FirmwareUpgrade {
         $upgraded = $false
         $script:HuuJobStarted = $false
         $huuError = $null
+        # HUU mounts the ISO itself. A volume left from an earlier run can hold
+        # the CIMC-mapped DVD slot and stop that mount.
+        try { Remove-CimcVmediaMap -Port $SerialPort -Config $Config -Volume $volume }
+        catch { Write-Log -Level WARN "Could not clear an earlier ISO mapping: $($_.Exception.Message)" }
         try {
             Invoke-CimcHuuUpgrade -CimcIp $TargetIp -RemoteIp $share.Ip -RemoteShare $share.Share `
                 -ShareUser ([string]$fw.shareUser) -SharePass ([string]$fw.sharePassword) -Fw $fw
@@ -2214,6 +2287,10 @@ function Invoke-FirmwareUpgrade {
 
         if ($upgraded) {
             Repair-CimcBootAfterHuu -Port $SerialPort -Config $Config -Fw $fw
+            # The HUU boot was this run's reboot. Only power the host back on
+            # if HUU left it off.
+            try { Invoke-CimcHostReboot -Port $SerialPort -Config $Config -Reason 'boot the installed system' -OnlyIfOff }
+            catch { Write-Log -Level WARN "Could not check the host power state after the upgrade: $($_.Exception.Message)" }
             Write-Host ''
             Write-Host "Firmware update and activate finished. The server is set to boot its drive." -ForegroundColor Yellow
         }
@@ -2312,9 +2389,29 @@ function Invoke-ConfigureServer {
         catch {
             Write-Log -Level WARN "Intersight Device Connector step did not complete: $($_.Exception.Message). All other configuration was committed; enable it from Admin > Device Connector if needed."
         }
+        # Last step reboots the host so the BIOS settings take effect. With the
+        # firmware step on, the HUU boot is that reboot.
         if ($script:FirmwareEnabled) {
-            Write-Log 'Firmware step enabled: mapping ISO via vMedia and setting boot order.'
+            Write-Log 'Firmware step enabled: running the HUU update. The HUU boot applies the settings above.'
             Invoke-FirmwareUpgrade -SerialPort $script:Port -Config $Config -TargetIp $ip
+        }
+        else {
+            $reboot = $true
+            if ($Config.behavior.PSObject.Properties.Name -contains 'rebootWhenDone') { $reboot = [bool]$Config.behavior.rebootWhenDone }
+            if ($reboot) {
+                try {
+                    if (-not (Sync-CimcPrompt -Port $script:Port -Attempts 3 -TimeoutSec 5)) {
+                        throw 'The serial console did not return a prompt.'
+                    }
+                    Invoke-CimcHostReboot -Port $script:Port -Config $Config -Reason 'apply UEFI secure boot'
+                }
+                catch {
+                    Write-Log -Level WARN "Configuration is committed, but the host was not rebooted: $($_.Exception.Message). Reboot it from the CIMC UI so UEFI secure boot takes effect."
+                }
+            }
+            else {
+                Write-Log 'behavior.rebootWhenDone is false. Reboot the host later so UEFI secure boot takes effect.'
+            }
         }
         Invoke-CimcLogout          -Port $script:Port
         Write-Log "===== Finished configuration for $hn ($ip) ====="

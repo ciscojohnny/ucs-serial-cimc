@@ -82,7 +82,11 @@
     "behavior": {
         "commandTimeoutSec":   20,
         "loginTimeoutSec":     60,
-        "interCommandDelayMs": 250
+        "interCommandDelayMs": 250,
+
+        // Reboot the host at the end so UEFI secure boot takes effect. When the
+        // firmware step is on, the HUU boot does this instead.
+        "rebootWhenDone":      true
     },
 
 
