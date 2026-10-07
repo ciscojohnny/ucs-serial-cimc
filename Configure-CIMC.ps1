@@ -1566,8 +1566,16 @@ function Set-CimcVmediaMap {
         }
         else { break }
         Start-Sleep -Milliseconds $delayMs
-        # Mount attempt can block the CLI while CIMC contacts the laptop.
-        $resp = Read-CimcSettle -Port $Port -TimeoutSec 90 -QuietMs 8000
+        # CIMC can take well over a minute to print the prompt again while it
+        # opens the ISO. The previous 90s limit expired as the hostname was
+        # still being written ("moa" of "moab-..."), which aborted the mount.
+        try {
+            $resp = Read-CimcSettle -Port $Port -TimeoutSec 180 -QuietMs 2000
+        }
+        catch {
+            Write-Log -Level WARN "map-www did not finish printing the prompt: $($_.Exception.Message). The mapping can still be active. Leaving the ISO server running."
+            return "map-www accepted $Volume"
+        }
         Write-CimcTail -Text $resp
     }
 
