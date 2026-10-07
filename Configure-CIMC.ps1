@@ -21,11 +21,12 @@
     the HUU XML fields do not. Keep both forms when they differ:
       Timezone: timezone-select. Newer menus say "Central Time"; older menus
         say "Central (most areas)". Leave the menu with answers, not Ctrl-C.
-      Device Connector: scope device-connector, then cimc/device-connector,
-        then scope cloud. "% invalid command" means try the next scope.
-      HUU www map: 6.0 takes remoteIp "http://host:port" and remoteShare
-        "/file.iso". 4.3 takes a bare IP in remoteIp and the full http URL
-        in remoteShare. Retry the 4.3 form after ISO Mapping Error.
+      Device Connector: settings live in scope device-connector or scope cloud.
+        On 4.3, scope cimc / scope device-connector is the firmware-update
+        scope. If "set enabled" is rejected, do not commit; that commit hangs.
+      HUU www map: 6.0 takes remoteIp "http://host:port", remoteShare
+        "/file.iso", plus bootMedium. On ISO Mapping Error, retry without
+        those 6.0-only fields, then with a bare IP and the full http URL.
       updateComponent "all" skips drives. "all,hdd" includes them.
     Requires PowerShell 5.1+ or 7+ on Windows with access to a serial adapter.
 
@@ -1072,15 +1073,17 @@ function Enable-IntersightDeviceConnector {
 
     Write-Log 'Enabling Intersight Device Connector (Cloud management).'
 
-    # This firmware rejects "scope cloud" with "% invalid command", which is not
-    # the older "Invalid scope" text. Try each known scope and only send the
-    # settings after the prompt is actually inside it.
+    # 6.0 enables the connector from "scope device-connector" or "scope cloud".
+    # On 4.3, "scope cimc / scope device-connector" is the firmware-update scope:
+    # "set enabled" is rejected there, and a commit with nothing staged hangs
+    # the serial CLI. Try each scope, and commit only after a set is accepted.
     $paths = @(
         ,@('scope device-connector')
-        ,@('scope cimc', 'scope device-connector')
         ,@('scope cloud')
+        ,@('scope cimc', 'scope cloud')
+        ,@('scope cimc', 'scope device-connector')
     )
-    $entered = $false
+    $configured = $false
     foreach ($path in $paths) {
         Send-Command -Port $Port -Command 'top' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
         $resp = ''
@@ -1093,45 +1096,36 @@ function Enable-IntersightDeviceConnector {
                 break
             }
         }
-        if (-not $rejected -and $resp -match '(?i)/(device-connector|cloud)\s*#') {
-            $entered = $true
-            break
+        if ($rejected -or $resp -notmatch '(?i)/(device-connector|cloud)\s*#') { continue }
+
+        $enable = Send-CimcConfirm -Port $Port -Command 'set enabled yes' -TimeoutSec $cmdTO -InterDelayMs $delayMs
+        if ($enable -match '(?i)invalid command|unrecognized') {
+            Write-Log "Scope '$(($path -join ' / '))' rejected 'set enabled'. Leaving it without commit."
+            continue
         }
+        $configured = $true
+        Send-CimcBestEffort -Port $Port -Command 'set read-only-mode no'        -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+        Send-CimcBestEffort -Port $Port -Command 'set tunneled-kvm-enabled yes' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+        Send-CimcBestEffort -Port $Port -Command 'set auto-update-enabled yes'  -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+        if ($Config.intersight.proxyHost) {
+            Send-CimcBestEffort -Port $Port -Command 'set proxy-enabled yes' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+            Send-CimcBestEffort -Port $Port -Command ("set proxy-host {0}" -f $Config.intersight.proxyHost) -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+            if ($Config.intersight.proxyPort) {
+                Send-CimcBestEffort -Port $Port -Command ("set proxy-port {0}" -f [int]$Config.intersight.proxyPort) -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+            }
+        }
+        try {
+            Send-CimcConfirm -Port $Port -Command 'commit' -TimeoutSec 30 -InterDelayMs $delayMs | Out-Null
+        }
+        catch {
+            Write-Log -Level WARN "Device Connector commit did not confirm: $($_.Exception.Message)"
+        }
+        break
     }
-    if (-not $entered) {
-        Write-Log -Level WARN 'Could not enter the Device Connector scope. Enable it in the CIMC UI (Admin > Device Connector) before claiming in Intersight.'
+    if (-not $configured) {
+        Write-Log -Level WARN 'Could not enable the Device Connector from the CLI on this firmware. Enable it in the CIMC UI (Admin > Device Connector) before claiming in Intersight.'
         Send-Command -Port $Port -Command 'top' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
         return
-    }
-
-    # Observed on C220 M7N: this scope answers these 'set' commands faster than
-    # the reader consumes them, so reads drift a prompt behind and the last one
-    # starves with an empty buffer. Resync first, then send each setting
-    # best-effort so a silent console cannot fail an otherwise-complete run.
-    Sync-CimcPrompt -Port $Port | Out-Null
-
-    Send-CimcBestEffort -Port $Port -Command 'set enabled yes'              -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-    Send-CimcBestEffort -Port $Port -Command 'set read-only-mode no'        -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-    Send-CimcBestEffort -Port $Port -Command 'set tunneled-kvm-enabled yes' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-    Send-CimcBestEffort -Port $Port -Command 'set auto-update-enabled yes'  -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-
-    if ($Config.intersight.proxyHost) {
-        Send-CimcBestEffort -Port $Port -Command 'set proxy-enabled yes' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-        Send-CimcBestEffort -Port $Port -Command ("set proxy-host {0}" -f $Config.intersight.proxyHost) -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-        if ($Config.intersight.proxyPort) {
-            Send-CimcBestEffort -Port $Port -Command ("set proxy-port {0}" -f [int]$Config.intersight.proxyPort) -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-        }
-    }
-
-    # The settings above are only staged until this commit lands, so retry it
-    # once after a resync before giving up.
-    try {
-        Send-CimcConfirm -Port $Port -Command 'commit' -TimeoutSec 30 -InterDelayMs $delayMs | Out-Null
-    }
-    catch {
-        Write-Log -Level WARN "Device Connector commit did not confirm: $($_.Exception.Message)"
-        Sync-CimcPrompt -Port $Port | Out-Null
-        Send-CimcBestEffort -Port $Port -Command 'commit' -TimeoutSec 30 -InterDelayMs $delayMs | Out-Null
     }
 
     # Report the resulting state so the operator knows whether the Device
@@ -2085,15 +2079,21 @@ function New-CimcHuuTriggerBody {
         [string]$ShareUser,
         [string]$SharePass,
         [Parameter(Mandatory)][string]$Component,
-        [Parameter(Mandatory)][int]$TimeoutMin
+        [Parameter(Mandatory)][int]$TimeoutMin,
+        [switch]$Legacy
     )
     $safeCookie = ConvertTo-CimcXmlValue $Cookie
     $xmlUser = ConvertTo-CimcXmlValue $ShareUser
     $xmlPass = ConvertTo-CimcXmlValue $SharePass
+    # 6.0 accepts updateType, doForceDown, gracefulTimeout, and bootMedium.
+    # 4.3 maps the ISO without those fields. Sending them with bootMedium
+    # "vmedia" produced ISO Mapping Error before CIMC opened the URL.
+    $newer = ''
+    if (-not $Legacy) { $newer = ' updateType="immediate" doForceDown="yes" gracefulTimeout="3" bootMedium="vmedia"' }
     return @"
 <configConfMo cookie="$safeCookie" dn="sys/huu/firmwareUpdater" inHierarchical="false">
   <inConfig>
-    <huuFirmwareUpdater dn="sys/huu/firmwareUpdater" adminState="trigger" mapType="www" remoteIp="$(ConvertTo-CimcXmlValue $RemoteIp)" remoteShare="$(ConvertTo-CimcXmlValue $RemoteShare)" username="$xmlUser" password="$xmlPass" updateComponent="$(ConvertTo-CimcXmlValue $Component)" stopOnError="no" timeOut="$TimeoutMin" verifyUpdate="no" updateType="immediate" doForceDown="yes" gracefulTimeout="3" bootMedium="vmedia" status="modified"/>
+    <huuFirmwareUpdater dn="sys/huu/firmwareUpdater" adminState="trigger" mapType="www" remoteIp="$(ConvertTo-CimcXmlValue $RemoteIp)" remoteShare="$(ConvertTo-CimcXmlValue $RemoteShare)" username="$xmlUser" password="$xmlPass" updateComponent="$(ConvertTo-CimcXmlValue $Component)" stopOnError="no" timeOut="$TimeoutMin" verifyUpdate="no"$newer status="modified"/>
   </inConfig>
 </configConfMo>
 "@
@@ -2142,7 +2142,7 @@ function Invoke-CimcHuuUpgrade {
 
     $deadline = (Get-Date).AddMinutes($timeoutMin + 30)
     $seenActive = $false
-    $mapRetried = $false
+    $mapAttempt = 0
     $retryPolls = 0
     $lastSummary = ''
     $lastBeat = [datetime]::MinValue
@@ -2184,7 +2184,7 @@ function Invoke-CimcHuuUpgrade {
             $lastBeat = Get-Date
             Write-Log 'HUU is still running. The ISO server stays up.'
         }
-        if ($mapRetried -and $overall -match '(?i)ISO Mapping Error') {
+        if ($mapAttempt -gt 0 -and $overall -match '(?i)ISO Mapping Error') {
             $retryPolls++
             if ($retryPolls -ge 6) {
                 throw "HUU finished with failures: $overall. CIMC never opened the ISO URL. Confirm the CIMC management IP can reach the laptop address and port in that URL."
@@ -2202,18 +2202,25 @@ function Invoke-CimcHuuUpgrade {
             }
             if ($failed.Count -gt 0 -or $overall -match '(?i)\b(fail|error)\b') {
                 $which = if ($failed.Count -gt 0) { $failed -join ', ' } else { $overall }
-                if ($overall -match '(?i)ISO Mapping Error' -and -not $mapRetried -and $MapRetryIp -and $MapRetryShare) {
-                    $mapRetried = $true
+                if ($overall -match '(?i)ISO Mapping Error' -and $mapAttempt -lt 2 -and $MapRetryIp -and $MapRetryShare) {
+                    $mapAttempt++
                     $retryPolls = 0
-                    Write-Log "CIMC reported ISO Mapping Error for $RemoteIp$RemoteShare and did not open that URL. Retrying with IP $MapRetryIp and share $MapRetryShare."
                     $oldEnd = $end
                     $oldStart = $start
                     $oldOverall = $overall
                     $seenActive = $false
                     $lastSummary = ''
                     if (-not $cookie) { $cookie = Connect-CimcXml -CimcIp $CimcIp }
-                    $body = New-CimcHuuTriggerBody -Cookie $cookie -RemoteIp $MapRetryIp -RemoteShare $MapRetryShare `
-                        -ShareUser $ShareUser -SharePass $SharePass -Component $component -TimeoutMin $timeoutMin
+                    if ($mapAttempt -eq 1) {
+                        Write-Log "CIMC reported ISO Mapping Error for $RemoteIp$RemoteShare and did not open that URL. Retrying without the 6.0-only HUU fields."
+                        $body = New-CimcHuuTriggerBody -Cookie $cookie -RemoteIp $RemoteIp -RemoteShare $RemoteShare `
+                            -ShareUser $ShareUser -SharePass $SharePass -Component $component -TimeoutMin $timeoutMin -Legacy
+                    }
+                    else {
+                        Write-Log "CIMC still could not map the ISO. Retrying with IP $MapRetryIp and share $MapRetryShare."
+                        $body = New-CimcHuuTriggerBody -Cookie $cookie -RemoteIp $MapRetryIp -RemoteShare $MapRetryShare `
+                            -ShareUser $ShareUser -SharePass $SharePass -Component $component -TimeoutMin $timeoutMin -Legacy
+                    }
                     $trigger = Send-CimcXmlRequest -CimcIp $CimcIp -Body $body -TimeoutSec 180
                     if ($trigger -match 'errorCode="([^"]+)"' -and $Matches[1]) {
                         $why = ([regex]::Match($trigger, 'errorDescr="([^"]*)"')).Groups[1].Value

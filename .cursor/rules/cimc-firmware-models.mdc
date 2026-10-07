@@ -11,9 +11,9 @@ Edits target standalone CIMC on C220/C240 M5, M6, and M7 (including M7N and M7S)
 When the CLI or the HUU XML disagrees, try the newer form and keep the fallback. Do not collapse both into the command that succeeded on the last server.
 
 - Timezone is `timezone-select` under `scope cimc`. Match both `Central Time` and `Central (most areas)`. Exit a failed menu with answers, not Ctrl-C.
-- Device Connector scopes, in order: `device-connector`, `cimc` then `device-connector`, then `cloud`. `% invalid command` is a miss, not success.
+- Device Connector settings are `scope device-connector` or `scope cloud`. On 4.3, `scope cimc` then `scope device-connector` is the firmware-update scope. If `set enabled` is rejected, do not `commit`; that commit hangs the serial CLI.
 - NTP enabled is the line `Enabled: yes`. A line that starts with `NTP` is the wrong check.
-- HUU www map: first `remoteIp=http://host:port` and `remoteShare=/file.iso` (6.0). On `ISO Mapping Error`, retry `remoteIp` as the bare IP and `remoteShare` as the full `http://host:port/file.iso` (4.3).
+- HUU www map: first `remoteIp=http://host:port` and `remoteShare=/file.iso` with `bootMedium` (6.0). On `ISO Mapping Error`, retry that address without the 6.0-only fields, then retry with `remoteIp` as the bare IP and `remoteShare` as the full `http://host:port/file.iso`.
 - `updateComponent` defaults to `all`, which skips drives. `all,hdd` includes drives. Do not switch the default.
 - Do not send `set enabled yes` plus commit under `scope vmedia`, do not send `set low-power-usb-enabled no`, and do not run `show mappings`. `map-www` needs the space before the filename. Send a blank username, not `anonymous`.
 - An empty precision boot list is valid. Do not fail the run because `LocalLUN` is missing.

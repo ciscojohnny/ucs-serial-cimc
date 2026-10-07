@@ -66,8 +66,8 @@ This script talks to standalone CIMC, not UCS Manager. It is tested on a C220 M7
 | Step | CIMC 6.0 | CIMC 4.3 |
 | --- | --- | --- |
 | Timezone | `timezone-select`. The US list says `Central Time`. | Same command. Older menus say `Central (most areas)`. |
-| Device Connector | `scope device-connector`. `scope cloud` is rejected. | `scope cimc` then `scope device-connector`, or `scope cloud` on older builds. |
-| HUU ISO address | `remoteIp` is `http://host:port` and `remoteShare` is `/file.iso`. | `remoteIp` is the bare IP and `remoteShare` is the full `http://` URL. |
+| Device Connector | `scope device-connector` accepts `set enabled yes`. | `scope cloud` is the settings scope. `scope cimc / scope device-connector` only updates connector firmware, and a commit there hangs the CLI. |
+| HUU ISO address | `remoteIp` is `http://host:port`, `remoteShare` is `/file.iso`, and the job includes `bootMedium`. | The same address is retried without the 6.0-only fields, then with the bare IP and the full `http://` URL. |
 | Drives | `updateComponent` `all` skips drives. | Same token. `all,hdd` is the only value that includes drives. |
 
 An empty precision boot list is normal. The script leaves the BIOS default order in place. It does not enable UEFI secure boot, and a configuration-only run does not reboot the host.
