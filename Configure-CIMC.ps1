@@ -886,12 +886,17 @@ function Set-CimcNtp {
     Send-CimcConfirm -Port $Port -Command 'commit' -TimeoutSec 30 -InterDelayMs $delayMs | Out-Null
 
     # Verify NTP is actually enabled before we try to load server addresses.
+    # CIMC prints this as "Enabled: yes" under "NTP Service Settings:", not on
+    # one line that starts with "NTP".
     $ntpStatus = Send-Command -Port $Port -Command 'show detail' `
         -ExpectPatterns @('#\s*$') -TimeoutSec 15 -InterDelayMs $delayMs
-    if ($ntpStatus -notmatch '(?im)^\s*NTP\s+(Enabled|Service|Status)?\s*[:=]\s*(yes|enabled|true)') {
-        Write-Log -Level WARN ("NTP did not report as enabled after commit; continuing anyway. show detail output:`n" + $ntpStatus)
-    } else {
+    if ($ntpStatus -match '(?im)Enabled:\s*(yes|enabled|true)\b') {
         Write-Log 'NTP service confirmed enabled.'
+        if ($ntpStatus -match '(?im)Status:\s*unsynchron') {
+            Write-Log 'NTP has not synchronised yet. That is normal until the servers answer.'
+        }
+    } else {
+        Write-Log -Level WARN ("NTP did not report as enabled after commit; continuing anyway. show detail output:`n" + $ntpStatus)
     }
 
     Write-Log 'Loading NTP server slots (commit #2).'
@@ -912,18 +917,104 @@ function Set-CimcNtp {
     Write-Log ("Post-commit NTP state:`n" + $finalNtp)
 
     if (-not [string]::IsNullOrWhiteSpace($Config.site.timezone)) {
-        Send-Command -Port $Port -Command 'top' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-        Send-Command -Port $Port -Command 'scope cimc' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-        $tzResp = Send-Command -Port $Port -Command ("set-timezone {0}" -f $Config.site.timezone) `
-            -ExpectPatterns @('#\s*$','Invalid','Unrecognized') -TimeoutSec 10 -InterDelayMs $delayMs
-        if ($tzResp -match 'Invalid|Unrecognized') {
-            Send-Command -Port $Port -Command 'scope clock' -ExpectPatterns @('#\s*$','Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-            Send-Command -Port $Port -Command ("set timezone {0}" -f $Config.site.timezone) `
-                -ExpectPatterns @('#\s*$','Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-            Send-Command -Port $Port -Command 'commit' -ExpectPatterns @('#\s*$') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-        }
+        Set-CimcTimezone -Port $Port -Name ([string]$Config.site.timezone) -TimeoutSec $cmdTO -InterDelayMs $delayMs
     }
     Write-Log 'NTP configured.'
+}
+
+function Get-CimcTimezoneSteps {
+    # timezone-select is a menu. These labels are the exact lines CIMC prints
+    # for the Olson names this config uses. The first label that appears wins.
+    param([Parameter(Mandatory)][string]$Name)
+    switch ($Name) {
+        'America/Chicago'     { ,@('Americas'); ,@('United States'); ,@('Central Time') }
+        'America/New_York'    { ,@('Americas'); ,@('United States'); ,@('Eastern Time') }
+        'America/Denver'      { ,@('Americas'); ,@('United States'); ,@('Mountain Time') }
+        'America/Los_Angeles' { ,@('Americas'); ,@('United States'); ,@('Pacific Time') }
+        'America/Phoenix'     { ,@('Americas'); ,@('United States'); ,@('Mountain Standard Time - Arizona (except Navajo)') }
+        'America/Anchorage'   { ,@('Americas'); ,@('United States'); ,@('Alaska Time') }
+        'Pacific/Honolulu'    { ,@('Americas'); ,@('United States'); ,@('Hawaii') }
+        'Europe/London'       { ,@('Europe'); ,@('United Kingdom', 'Britain (UK)', 'Britain') }
+        'UTC'                 { ,@('UTC', 'Etc') }
+    }
+}
+
+function Stop-CimcTimezoneMenu {
+    param([Parameter(Mandatory)][System.IO.Ports.SerialPort]$Port)
+    try { $Port.Write([string][char]3) } catch {}
+    Start-Sleep -Milliseconds 300
+    Sync-CimcPrompt -Port $Port | Out-Null
+}
+
+function Set-CimcTimezone {
+    # CIMC 4.x/6.x rejects "set timezone" and "set-timezone". The working
+    # command is the interactive timezone-select menu under scope cimc.
+    param(
+        [Parameter(Mandatory)][System.IO.Ports.SerialPort]$Port,
+        [Parameter(Mandatory)][string]$Name,
+        [int]$TimeoutSec = 20,
+        [int]$InterDelayMs = 250
+    )
+    $steps = @(Get-CimcTimezoneSteps -Name $Name)
+    if ($steps.Count -eq 0) {
+        Write-Log -Level WARN "Timezone '$Name' has no timezone-select path. Set it in the CIMC UI (Admin > Timezone)."
+        return
+    }
+
+    Write-Log "Setting timezone to $Name."
+    Send-Command -Port $Port -Command 'top' -TimeoutSec $TimeoutSec -InterDelayMs $InterDelayMs | Out-Null
+    Send-Command -Port $Port -Command 'scope cimc' -TimeoutSec $TimeoutSec -InterDelayMs $InterDelayMs | Out-Null
+    $menu = Send-Command -Port $Port -Command 'timezone-select' `
+        -ExpectPatterns @('(?m)#\?\s*$', '(?i)invalid', '#\s*$') -TimeoutSec $TimeoutSec -InterDelayMs $InterDelayMs
+    if ($menu -match '(?i)invalid' -or $menu -notmatch '(?m)#\?\s*$') {
+        Write-Log -Level WARN "CIMC did not open timezone-select for '$Name'. Set it in the CIMC UI (Admin > Timezone)."
+        return
+    }
+
+    foreach ($labels in $steps) {
+        if ($menu -match '(?i)above information OK') { break }
+        $choice = $null
+        $wanted = ''
+        foreach ($label in @($labels)) {
+            foreach ($hit in [regex]::Matches($menu, '(?m)^\s*(\d+)\)\s+(.+?)\s*$')) {
+                if ($hit.Groups[2].Value -eq $label) {
+                    $choice = $hit.Groups[1].Value
+                    $wanted = $label
+                    break
+                }
+            }
+            if ($choice) { break }
+        }
+        if (-not $choice) {
+            Write-Log -Level WARN "Timezone menu has no entry for '$($labels -join "' or '")' while setting '$Name'. Set it in the CIMC UI (Admin > Timezone)."
+            Stop-CimcTimezoneMenu -Port $Port
+            return
+        }
+        Write-Log "Timezone menu: $choice) $wanted"
+        $menu = Send-Command -Port $Port -Command $choice `
+            -ExpectPatterns @('(?m)#\?\s*$', '(?i)Continue\?', '(?i)invalid', '#\s*$') `
+            -TimeoutSec $TimeoutSec -InterDelayMs $InterDelayMs
+        if ($menu -match '(?i)invalid') {
+            Write-Log -Level WARN "CIMC rejected timezone choice $choice while setting '$Name'."
+            Stop-CimcTimezoneMenu -Port $Port
+            return
+        }
+    }
+
+    if ($menu -match '(?i)above information OK') {
+        $menu = Send-Command -Port $Port -Command '1' `
+            -ExpectPatterns @('(?i)Continue\?', '#\s*$', '(?i)invalid') `
+            -TimeoutSec $TimeoutSec -InterDelayMs $InterDelayMs
+    }
+    if ($menu -match '(?i)Continue\?') {
+        $menu = Send-Command -Port $Port -Command 'y' `
+            -ExpectPatterns @('#\s*$') -TimeoutSec $TimeoutSec -InterDelayMs $InterDelayMs
+    }
+    if ($menu -match '(?i)Timezone has been updated') {
+        Write-Log "Timezone set to $Name."
+    } else {
+        Write-Log -Level WARN "CIMC did not confirm timezone '$Name'. Check Admin > Timezone in the CIMC UI."
+    }
 }
 
 function Enable-IntersightDeviceConnector {
@@ -939,10 +1030,36 @@ function Enable-IntersightDeviceConnector {
 
     Write-Log 'Enabling Intersight Device Connector (Cloud management).'
 
-    Send-Command -Port $Port -Command 'top' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
-    $resp = Send-Command -Port $Port -Command 'scope cloud' -ExpectPatterns @('#\s*$','Invalid scope') -TimeoutSec 10 -InterDelayMs $delayMs
-    if ($resp -match 'Invalid scope') {
-        Send-Command -Port $Port -Command 'scope device-connector' -ExpectPatterns @('#\s*$','Invalid scope') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+    # This firmware rejects "scope cloud" with "% invalid command", which is not
+    # the older "Invalid scope" text. Try each known scope and only send the
+    # settings after the prompt is actually inside it.
+    $paths = @(
+        ,@('scope device-connector')
+        ,@('scope cimc', 'scope device-connector')
+        ,@('scope cloud')
+    )
+    $entered = $false
+    foreach ($path in $paths) {
+        Send-Command -Port $Port -Command 'top' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+        $resp = ''
+        $rejected = $false
+        foreach ($cmd in $path) {
+            $resp = Send-Command -Port $Port -Command $cmd `
+                -ExpectPatterns @('#\s*$', '(?i)invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs
+            if ($resp -match '(?i)invalid command|invalid scope|unrecognized') {
+                $rejected = $true
+                break
+            }
+        }
+        if (-not $rejected -and $resp -match '(?i)/(device-connector|cloud)\s*#') {
+            $entered = $true
+            break
+        }
+    }
+    if (-not $entered) {
+        Write-Log -Level WARN 'Could not enter the Device Connector scope. Enable it in the CIMC UI (Admin > Device Connector) before claiming in Intersight.'
+        Send-Command -Port $Port -Command 'top' -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
+        return
     }
 
     # Observed on C220 M7N: this scope answers these 'set' commands faster than
@@ -1348,13 +1465,43 @@ server.serve_forever()
     $psi.RedirectStandardError  = $true
     $proc = [System.Diagnostics.Process]::Start($psi)
     $logPath = $script:SessionLog
+    # CIMC reads the ISO in thousands of byte-range requests. Keep the first
+    # request from each client, every error, and one summary a minute.
+    $script:HttpLogState = [hashtable]::Synchronized(@{
+        LogPath = $logPath
+        Hits    = 0
+        Last    = [datetime]::UtcNow
+        Seen    = '|'
+    })
     foreach ($evt in @('OutputDataReceived','ErrorDataReceived')) {
-        Register-ObjectEvent -InputObject $proc -EventName $evt -MessageData $logPath `
+        Register-ObjectEvent -InputObject $proc -EventName $evt -MessageData $script:HttpLogState `
             -SourceIdentifier ("CimcHttp{0}{1}" -f $evt, $proc.Id) -Action {
                 $text = $EventArgs.Data
                 if (-not $text) { return }
-                $line = '{0} [INFO] HTTP: {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'), $text
-                Add-Content -LiteralPath $Event.MessageData -Value $line
+                $st = $Event.MessageData
+                $level = 'INFO'
+                $show = $false
+                if ($text -match '^(\S+) - "[A-Z]+ [^"]*" (\d+)') {
+                    $ip = $Matches[1]
+                    $code = [int]$Matches[2]
+                    $st.Hits = [int]$st.Hits + 1
+                    if ($code -ge 400) { $level = 'WARN'; $show = $true }
+                    elseif ($st.Seen -notlike "*|$ip|*") {
+                        $st.Seen = $st.Seen + $ip + '|'
+                        $show = $true
+                    }
+                    elseif (((Get-Date).ToUniversalTime() - [datetime]$st.Last).TotalSeconds -ge 60) {
+                        $st.Last = [datetime]::UtcNow
+                        $text = "$($st.Hits) requests so far. Latest: $text"
+                        $show = $true
+                    }
+                } else {
+                    $show = $true
+                    if ($text -match '(?i)error|traceback|exception') { $level = 'WARN' }
+                }
+                if (-not $show) { return }
+                $line = '{0} [{1}] HTTP: {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'), $level, $text
+                Add-Content -LiteralPath $st.LogPath -Value $line
                 Write-Host $line
             } | Out-Null
     }
@@ -1386,7 +1533,9 @@ function Stop-IsoHttpServer {
     if ($Proc -and -not $Proc.HasExited) {
         try { $Proc.Kill() } catch {}
         try { $Proc.WaitForExit(3000) | Out-Null } catch {}
-        Write-Log 'Local HTTP server stopped.'
+        $hits = 0
+        if ($script:HttpLogState) { $hits = [int]$script:HttpLogState.Hits }
+        Write-Log "Local HTTP server stopped ($hits requests)."
     }
     if ($script:IsoHelperPath -and (Test-Path -LiteralPath $script:IsoHelperPath)) {
         Remove-Item -LiteralPath $script:IsoHelperPath -Force -ErrorAction SilentlyContinue
@@ -1946,19 +2095,21 @@ function Invoke-CimcHuuUpgrade {
         $overall = [string]$status.Overall
         if ($start -and $start -ne $oldStart -and $start -notmatch '^(NA|N/A|none)?$') { $seenActive = $true }
         if ($overall -and $overall -ne $oldOverall -and $overall -match '(?i)progress|running|updating|activat|boot|trigger') { $seenActive = $true }
-        $lines = @()
+        $done = 0; $running = 0; $skipped = 0
         foreach ($item in @($status.Components)) {
-            $label = $item.Name
-            if ($item.Update) { $label = "$label $($item.Update)" }
-            if ($item.Error) { $label = "$label ($($item.Error))" }
-            $lines += $label
+            if ($item.Update -match '(?i)complete|success') { $done++ }
+            elseif ($item.Update -match '(?i)progress|running') { $running++ }
+            elseif ($item.Update -match '(?i)skip') { $skipped++ }
         }
-        $summary = ($overall, ($lines -join '; ')) -join ' | '
+        $phrase = $overall
+        if ($phrase -match '\s{2,}') { $phrase = ($phrase -split '\s{2,}', 2)[0].Trim() }
+        $summary = "HUU: $phrase"
+        if (@($status.Components).Count -gt 0) {
+            $summary = "$summary. Completed $done, in progress $running, skipped $skipped."
+        }
         if ($summary -and $summary -ne $lastSummary) {
             $lastSummary = $summary
-            $shown = $summary
-            if ($shown.Length -gt 500) { $shown = $shown.Substring(0, 500) }
-            Write-Log "HUU: $shown"
+            Write-Log $summary
         }
         elseif (((Get-Date) - $lastBeat).TotalSeconds -ge 120) {
             $lastBeat = Get-Date
@@ -1970,7 +2121,7 @@ function Invoke-CimcHuuUpgrade {
             $failed = @()
             foreach ($item in @($status.Components)) {
                 $detail = "{0}: update={1}; verify={2}; running={3}; new={4}" -f $item.Name, $item.Update, $item.Verify, $item.Running, $item.New
-                if ($item.Error) { $detail = "$detail; error=$($item.Error)" }
+                if ($item.Error -and $item.Error -notmatch '^(?i)(NA|N/A|-|none)$') { $detail = "$detail; error=$($item.Error)" }
                 Write-Log $detail
                 if (($item.Update + ' ' + $item.Error) -match '(?i)fail|error') { $failed += $item.Name }
             }
@@ -2005,6 +2156,10 @@ function Repair-CimcBootAfterHuu {
         Send-Command -Port $Port -Command 'scope bios' -ExpectPatterns @('#\s*$','Invalid') -TimeoutSec $cmdTO -InterDelayMs $delayMs | Out-Null
         $listed = Send-Command -Port $Port -Command 'show boot-device' -ExpectPatterns @('#\s*$') -TimeoutSec $cmdTO -InterDelayMs $delayMs
         $known = @(Get-CimcBootDeviceNames -Text $listed)
+        if ($known.Count -eq 0) {
+            Write-Log 'CIMC has no precision boot devices. The BIOS default order is used, and the ISO mapping was removed.'
+            return
+        }
         if ($known -notcontains $lunName) {
             Write-Log -Level WARN "Boot device '$lunName' is not in the CIMC list. The ISO mapping was removed. Put the boot drive first in the CIMC boot order if the server comes back on the HUU."
             return

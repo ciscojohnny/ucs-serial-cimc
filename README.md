@@ -177,6 +177,6 @@ UCS Standalone**.
 | HUU job does not start, or the ISO never downloads           | Laptop Ethernet is not on the CIMC subnet, the firewall blocks `servePort`, the ISO name is wrong, or Python is not installed. |
 | `create-boot-device` / `set subtype` / `power cycle` rejected | Automatic HUU did not start, and a fallback boot token was rejected. Adjust the names in the `"firmware"` block and retry. |
 | `Authentication failed with both supplied and factory-default passwords` | Someone has changed the CIMC password and the value typed at the prompt is wrong. |
-| `Invalid scope` on `scope cloud` / `scope device-connector`   | Very old CIMC firmware — upgrade it and retry.                        |
+| `Could not enter the Device Connector scope`                  | The script tried `device-connector`, `cimc/device-connector`, and `cloud`. Enable it under **Admin → Device Connector**. |
 | `active-active` rejected                                      | Only valid with a `shared_lom*` NIC mode. Use `none` with `dedicated`. |
 | `Network commit did not return to CLI prompt …`               | CIMC produced an unexpected confirmation prompt; check the session log under `logs/` for the last RX. |
