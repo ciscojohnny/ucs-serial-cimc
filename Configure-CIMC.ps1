@@ -917,7 +917,12 @@ function Set-CimcNtp {
     Write-Log ("Post-commit NTP state:`n" + $finalNtp)
 
     if (-not [string]::IsNullOrWhiteSpace($Config.site.timezone)) {
-        Set-CimcTimezone -Port $Port -Name ([string]$Config.site.timezone) -TimeoutSec $cmdTO -InterDelayMs $delayMs
+        try {
+            Set-CimcTimezone -Port $Port -Name ([string]$Config.site.timezone) -TimeoutSec $cmdTO -InterDelayMs $delayMs
+        }
+        catch {
+            Write-Log -Level WARN "Timezone step did not finish: $($_.Exception.Message). Set it in the CIMC UI (Admin > Timezone)."
+        }
     }
     Write-Log 'NTP configured.'
 }
@@ -927,22 +932,44 @@ function Get-CimcTimezoneSteps {
     # for the Olson names this config uses. The first label that appears wins.
     param([Parameter(Mandatory)][string]$Name)
     switch ($Name) {
-        'America/Chicago'     { ,@('Americas'); ,@('United States'); ,@('Central Time') }
-        'America/New_York'    { ,@('Americas'); ,@('United States'); ,@('Eastern Time') }
-        'America/Denver'      { ,@('Americas'); ,@('United States'); ,@('Mountain Time') }
-        'America/Los_Angeles' { ,@('Americas'); ,@('United States'); ,@('Pacific Time') }
-        'America/Phoenix'     { ,@('Americas'); ,@('United States'); ,@('Mountain Standard Time - Arizona (except Navajo)') }
-        'America/Anchorage'   { ,@('Americas'); ,@('United States'); ,@('Alaska Time') }
+        'America/Chicago'     { ,@('Americas'); ,@('United States'); ,@('Central Time', 'Central (most areas)', 'Central Time (most areas)') }
+        'America/New_York'    { ,@('Americas'); ,@('United States'); ,@('Eastern Time', 'Eastern (most areas)', 'Eastern Time (most areas)') }
+        'America/Denver'      { ,@('Americas'); ,@('United States'); ,@('Mountain Time', 'Mountain (most areas)') }
+        'America/Los_Angeles' { ,@('Americas'); ,@('United States'); ,@('Pacific Time', 'Pacific') }
+        'America/Phoenix'     { ,@('Americas'); ,@('United States'); ,@('Mountain Standard Time - Arizona (except Navajo)', 'MST - AZ (except Navajo)', 'Mountain Standard - AZ (except Navajo)') }
+        'America/Anchorage'   { ,@('Americas'); ,@('United States'); ,@('Alaska Time', 'Alaska (most areas)') }
         'Pacific/Honolulu'    { ,@('Americas'); ,@('United States'); ,@('Hawaii') }
         'Europe/London'       { ,@('Europe'); ,@('United Kingdom', 'Britain (UK)', 'Britain') }
         'UTC'                 { ,@('UTC', 'Etc') }
     }
 }
 
-function Stop-CimcTimezoneMenu {
-    param([Parameter(Mandatory)][System.IO.Ports.SerialPort]$Port)
-    try { $Port.Write([string][char]3) } catch {}
-    Start-Sleep -Milliseconds 300
+function Exit-CimcTimezoneMenu {
+    # Ctrl-C does not return this firmware to the CLI prompt. Pick the first
+    # entry until the confirm question, accept it, then answer n so tzselect
+    # exits without saving. The serial session stays usable for the next step.
+    param(
+        [Parameter(Mandatory)][System.IO.Ports.SerialPort]$Port,
+        [string]$Menu,
+        [int]$TimeoutSec = 30,
+        [int]$InterDelayMs = 250
+    )
+    $wait = @('(?m)#\?\s*$', '(?i)Continue\?', '(?i)above information OK', '#\s*$')
+    for ($n = 0; $n -lt 6; $n++) {
+        if ($Menu -match '(?i)Continue\?') {
+            Send-Command -Port $Port -Command 'n' -ExpectPatterns @('#\s*$', '(?m)#\?\s*$') -TimeoutSec $TimeoutSec -InterDelayMs $InterDelayMs | Out-Null
+            break
+        }
+        if ($Menu -match '(?i)above information OK') {
+            $Menu = Send-Command -Port $Port -Command '1' -ExpectPatterns $wait -TimeoutSec $TimeoutSec -InterDelayMs $InterDelayMs
+            continue
+        }
+        if ($Menu -match '(?m)#\?\s*$') {
+            $Menu = Send-Command -Port $Port -Command '1' -ExpectPatterns $wait -TimeoutSec $TimeoutSec -InterDelayMs $InterDelayMs
+            continue
+        }
+        break
+    }
     Sync-CimcPrompt -Port $Port | Out-Null
 }
 
@@ -964,9 +991,13 @@ function Set-CimcTimezone {
     Write-Log "Setting timezone to $Name."
     Send-Command -Port $Port -Command 'top' -TimeoutSec $TimeoutSec -InterDelayMs $InterDelayMs | Out-Null
     Send-Command -Port $Port -Command 'scope cimc' -TimeoutSec $TimeoutSec -InterDelayMs $InterDelayMs | Out-Null
+    # Wait for the menu prompt (#?). A CLI prompt ending in '#' arrives before
+    # the region list on some firmware and used to cut the read off early.
+    $menuWait = @('(?m)#\?\s*$', '(?i)Continue\?', '(?i)above information OK')
+    $menuTimeout = [Math]::Max($TimeoutSec, 45)
     $menu = Send-Command -Port $Port -Command 'timezone-select' `
-        -ExpectPatterns @('(?m)#\?\s*$', '(?i)invalid', '#\s*$') -TimeoutSec $TimeoutSec -InterDelayMs $InterDelayMs
-    if ($menu -match '(?i)invalid' -or $menu -notmatch '(?m)#\?\s*$') {
+        -ExpectPatterns $menuWait -TimeoutSec $menuTimeout -InterDelayMs $InterDelayMs
+    if ($menu -notmatch '(?m)#\?\s*$') {
         Write-Log -Level WARN "CIMC did not open timezone-select for '$Name'. Set it in the CIMC UI (Admin > Timezone)."
         return
     }
@@ -986,34 +1017,35 @@ function Set-CimcTimezone {
             if ($choice) { break }
         }
         if (-not $choice) {
-            Write-Log -Level WARN "Timezone menu has no entry for '$($labels -join "' or '")' while setting '$Name'. Set it in the CIMC UI (Admin > Timezone)."
-            Stop-CimcTimezoneMenu -Port $Port
+            $shown = @([regex]::Matches($menu, '(?m)^\s*\d+\).*$') | ForEach-Object { $_.Value.Trim() }) -join '; '
+            if ($shown.Length -gt 500) { $shown = $shown.Substring(0, 500) }
+            Write-Log -Level WARN "Timezone menu has no entry for '$($labels -join "' or '")' while setting '$Name'. Menu was: $shown"
+            try { Exit-CimcTimezoneMenu -Port $Port -Menu $menu -TimeoutSec $menuTimeout -InterDelayMs $InterDelayMs }
+            catch { Write-Log -Level WARN "Could not leave the timezone menu: $($_.Exception.Message)" }
             return
         }
         Write-Log "Timezone menu: $choice) $wanted"
         $menu = Send-Command -Port $Port -Command $choice `
-            -ExpectPatterns @('(?m)#\?\s*$', '(?i)Continue\?', '(?i)invalid', '#\s*$') `
-            -TimeoutSec $TimeoutSec -InterDelayMs $InterDelayMs
-        if ($menu -match '(?i)invalid') {
-            Write-Log -Level WARN "CIMC rejected timezone choice $choice while setting '$Name'."
-            Stop-CimcTimezoneMenu -Port $Port
-            return
-        }
+            -ExpectPatterns $menuWait -TimeoutSec $menuTimeout -InterDelayMs $InterDelayMs
     }
 
     if ($menu -match '(?i)above information OK') {
         $menu = Send-Command -Port $Port -Command '1' `
-            -ExpectPatterns @('(?i)Continue\?', '#\s*$', '(?i)invalid') `
-            -TimeoutSec $TimeoutSec -InterDelayMs $InterDelayMs
+            -ExpectPatterns @('(?i)Continue\?', '#\s*$') `
+            -TimeoutSec $menuTimeout -InterDelayMs $InterDelayMs
     }
     if ($menu -match '(?i)Continue\?') {
         $menu = Send-Command -Port $Port -Command 'y' `
-            -ExpectPatterns @('#\s*$') -TimeoutSec $TimeoutSec -InterDelayMs $InterDelayMs
+            -ExpectPatterns @('#\s*$') -TimeoutSec $menuTimeout -InterDelayMs $InterDelayMs
     }
     if ($menu -match '(?i)Timezone has been updated') {
         Write-Log "Timezone set to $Name."
     } else {
         Write-Log -Level WARN "CIMC did not confirm timezone '$Name'. Check Admin > Timezone in the CIMC UI."
+        if ($menu -notmatch '#\s*$') {
+            try { Exit-CimcTimezoneMenu -Port $Port -Menu $menu -TimeoutSec $menuTimeout -InterDelayMs $InterDelayMs }
+            catch { Write-Log -Level WARN "Could not leave the timezone menu: $($_.Exception.Message)" }
+        }
     }
 }
 
@@ -1897,7 +1929,8 @@ function Initialize-CimcXmlTls {
                     Write-Log -Level WARN ("This certificate expired on {0}. It is no longer valid and will be rejected by clients that verify it. The management session continues because this is the CIMC appliance certificate." -f $x509.NotAfter.ToString('yyyy-MM-dd'))
                 }
                 if ($x509.NotBefore -gt (Get-Date)) {
-                    Write-Log -Level WARN ("This certificate is not yet valid. Its validity period begins on {0}." -f $x509.NotBefore.ToString('yyyy-MM-dd'))
+                    Write-Log -Level WARN ("This certificate is not yet valid. Its validity period begins on {0}." -f $x509.NotBefore.ToString('yyyy-MM-dd HH:mm'))
+                    Write-Log 'The CIMC clock can be ahead of this laptop until NTP synchronises. The management session continues.'
                 }
                 $weakRsa = ($x509.PublicKey.Oid.FriendlyName -match 'RSA' -and $keyBits -match '^\d+$' -and [int]$keyBits -lt 2048)
                 $weakEc = ($x509.PublicKey.Oid.FriendlyName -match 'ECC|ECDSA' -and $keyBits -match '^\d+$' -and [int]$keyBits -lt 256)
@@ -2024,7 +2057,36 @@ function Get-CimcHuuShare {
     $path = $uri.AbsolutePath
     if (-not $path.EndsWith('/')) { $path += '/' }
     $remoteShare = ($path + $IsoFile) -replace '(?<!:)/{2,}', '/'
-    return [pscustomobject]@{ Ip = $remoteIp; Share = $remoteShare }
+    # 6.0 accepts the URL in remoteIp. 4.3 validates remoteIp as a bare address
+    # and takes the full http://host:port/file URL in remoteShare.
+    return [pscustomobject]@{
+        Ip       = $remoteIp
+        Share    = $remoteShare
+        Host     = $uri.Host
+        ShareUrl = ($remoteIp.TrimEnd('/') + $remoteShare)
+    }
+}
+
+function New-CimcHuuTriggerBody {
+    param(
+        [Parameter(Mandatory)][string]$Cookie,
+        [Parameter(Mandatory)][string]$RemoteIp,
+        [Parameter(Mandatory)][string]$RemoteShare,
+        [string]$ShareUser,
+        [string]$SharePass,
+        [Parameter(Mandatory)][string]$Component,
+        [Parameter(Mandatory)][int]$TimeoutMin
+    )
+    $safeCookie = ConvertTo-CimcXmlValue $Cookie
+    $xmlUser = ConvertTo-CimcXmlValue $ShareUser
+    $xmlPass = ConvertTo-CimcXmlValue $SharePass
+    return @"
+<configConfMo cookie="$safeCookie" dn="sys/huu/firmwareUpdater" inHierarchical="false">
+  <inConfig>
+    <huuFirmwareUpdater dn="sys/huu/firmwareUpdater" adminState="trigger" mapType="www" remoteIp="$(ConvertTo-CimcXmlValue $RemoteIp)" remoteShare="$(ConvertTo-CimcXmlValue $RemoteShare)" username="$xmlUser" password="$xmlPass" updateComponent="$(ConvertTo-CimcXmlValue $Component)" stopOnError="no" timeOut="$TimeoutMin" verifyUpdate="no" updateType="immediate" doForceDown="yes" gracefulTimeout="3" bootMedium="vmedia" status="modified"/>
+  </inConfig>
+</configConfMo>
+"@
 }
 
 function Invoke-CimcHuuUpgrade {
@@ -2037,6 +2099,8 @@ function Invoke-CimcHuuUpgrade {
         [Parameter(Mandatory)][string]$RemoteShare,
         [string]$ShareUser,
         [string]$SharePass,
+        [string]$MapRetryIp,
+        [string]$MapRetryShare,
         [Parameter(Mandatory)][object]$Fw
     )
     $component = if ($Fw.updateComponent) { [string]$Fw.updateComponent } else { 'all,hdd' }
@@ -2052,16 +2116,8 @@ function Invoke-CimcHuuUpgrade {
     $oldStart = [string]$prior.StartTime
     $oldOverall = [string]$prior.Overall
 
-    $xmlUser = ConvertTo-CimcXmlValue $ShareUser
-    $xmlPass = ConvertTo-CimcXmlValue $SharePass
-    $safeCookie = ConvertTo-CimcXmlValue $cookie
-    $body = @"
-<configConfMo cookie="$safeCookie" dn="sys/huu/firmwareUpdater" inHierarchical="false">
-  <inConfig>
-    <huuFirmwareUpdater dn="sys/huu/firmwareUpdater" adminState="trigger" mapType="www" remoteIp="$(ConvertTo-CimcXmlValue $RemoteIp)" remoteShare="$(ConvertTo-CimcXmlValue $RemoteShare)" username="$xmlUser" password="$xmlPass" updateComponent="$(ConvertTo-CimcXmlValue $component)" stopOnError="no" timeOut="$timeoutMin" verifyUpdate="no" updateType="immediate" doForceDown="yes" gracefulTimeout="3" bootMedium="vmedia" status="modified"/>
-  </inConfig>
-</configConfMo>
-"@
+    $body = New-CimcHuuTriggerBody -Cookie $cookie -RemoteIp $RemoteIp -RemoteShare $RemoteShare `
+        -ShareUser $ShareUser -SharePass $SharePass -Component $component -TimeoutMin $timeoutMin
     Write-Log "Starting HUU update and activate for '$component' from $RemoteIp$RemoteShare. CIMC allows up to $timeoutMin minutes. Leave this window open."
     Write-Host ''
     Write-Host "HUU is updating and activating every component. This often takes one to three hours." -ForegroundColor Yellow
@@ -2076,6 +2132,8 @@ function Invoke-CimcHuuUpgrade {
 
     $deadline = (Get-Date).AddMinutes($timeoutMin + 30)
     $seenActive = $false
+    $mapRetried = $false
+    $retryPolls = 0
     $lastSummary = ''
     $lastBeat = [datetime]::MinValue
     while ((Get-Date) -lt $deadline) {
@@ -2095,6 +2153,7 @@ function Invoke-CimcHuuUpgrade {
         $overall = [string]$status.Overall
         if ($start -and $start -ne $oldStart -and $start -notmatch '^(NA|N/A|none)?$') { $seenActive = $true }
         if ($overall -and $overall -ne $oldOverall -and $overall -match '(?i)progress|running|updating|activat|boot|trigger') { $seenActive = $true }
+        if ($overall -match '(?i)mapping error') { $seenActive = $true }
         $done = 0; $running = 0; $skipped = 0
         foreach ($item in @($status.Components)) {
             if ($item.Update -match '(?i)complete|success') { $done++ }
@@ -2115,6 +2174,12 @@ function Invoke-CimcHuuUpgrade {
             $lastBeat = Get-Date
             Write-Log 'HUU is still running. The ISO server stays up.'
         }
+        if ($mapRetried -and $overall -match '(?i)ISO Mapping Error') {
+            $retryPolls++
+            if ($retryPolls -ge 6) {
+                throw "HUU finished with failures: $overall. CIMC never opened the ISO URL. Confirm the CIMC management IP can reach the laptop address and port in that URL."
+            }
+        }
         $endIsNew = $end -and $end -notmatch '^(NA|N/A|none|null)?$' -and $end -ne $oldEnd
         if ($seenActive -and $endIsNew) {
             Write-Log "HUU finished. Image '$($status.Image)'. Overall: $overall"
@@ -2127,6 +2192,29 @@ function Invoke-CimcHuuUpgrade {
             }
             if ($failed.Count -gt 0 -or $overall -match '(?i)\b(fail|error)\b') {
                 $which = if ($failed.Count -gt 0) { $failed -join ', ' } else { $overall }
+                if ($overall -match '(?i)ISO Mapping Error' -and -not $mapRetried -and $MapRetryIp -and $MapRetryShare) {
+                    $mapRetried = $true
+                    $retryPolls = 0
+                    Write-Log "CIMC reported ISO Mapping Error for $RemoteIp$RemoteShare and did not open that URL. Retrying with IP $MapRetryIp and share $MapRetryShare."
+                    $oldEnd = $end
+                    $oldStart = $start
+                    $oldOverall = $overall
+                    $seenActive = $false
+                    $lastSummary = ''
+                    if (-not $cookie) { $cookie = Connect-CimcXml -CimcIp $CimcIp }
+                    $body = New-CimcHuuTriggerBody -Cookie $cookie -RemoteIp $MapRetryIp -RemoteShare $MapRetryShare `
+                        -ShareUser $ShareUser -SharePass $SharePass -Component $component -TimeoutMin $timeoutMin
+                    $trigger = Send-CimcXmlRequest -CimcIp $CimcIp -Body $body -TimeoutSec 180
+                    if ($trigger -match 'errorCode="([^"]+)"' -and $Matches[1]) {
+                        $why = ([regex]::Match($trigger, 'errorDescr="([^"]*)"')).Groups[1].Value
+                        if (-not $why) { $why = 'CIMC rejected the HUU update request.' }
+                        throw $why
+                    }
+                    continue
+                }
+                if ($overall -match '(?i)ISO Mapping Error') {
+                    throw "HUU finished with failures: $which. CIMC never opened the ISO URL. Confirm the CIMC management IP can reach the laptop address and port in that URL."
+                }
                 throw "HUU finished with failures: $which"
             }
             return
@@ -2373,6 +2461,7 @@ function Invoke-FirmwareUpgrade {
         catch { Write-Log -Level WARN "Could not clear an earlier ISO mapping: $($_.Exception.Message)" }
         try {
             Invoke-CimcHuuUpgrade -CimcIp $TargetIp -RemoteIp $share.Ip -RemoteShare $share.Share `
+                -MapRetryIp $share.Host -MapRetryShare $share.ShareUrl `
                 -ShareUser ([string]$fw.shareUser) -SharePass ([string]$fw.sharePassword) -Fw $fw
             $upgraded = $true
         }

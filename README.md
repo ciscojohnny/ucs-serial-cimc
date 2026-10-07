@@ -175,6 +175,7 @@ UCS Standalone**.
 | `Timeout waiting for pattern(s): login:`                      | Baud rate / wiring / wrong physical port (use the rear console jack). After a factory reset, wait — CIMC boot can take several minutes. |
 | Script appears stuck at "Probing CIMC prompt..."              | Another app (PuTTY / SecureCRT / Tera Term / `screen`) has the serial port open, or CIMC is still booting. |
 | HUU job does not start, or the ISO never downloads           | Laptop Ethernet is not on the CIMC subnet, the firewall blocks `servePort`, the ISO name is wrong, or Python is not installed. |
+| `ISO Mapping Error`                                           | CIMC accepted the job but never opened the ISO URL. On 4.3 the script retries with the bare server IP and the full `http://` address. Confirm the CIMC IP can reach that laptop address and port. |
 | `create-boot-device` / `set subtype` / `power cycle` rejected | Automatic HUU did not start, and a fallback boot token was rejected. Adjust the names in the `"firmware"` block and retry. |
 | `Authentication failed with both supplied and factory-default passwords` | Someone has changed the CIMC password and the value typed at the prompt is wrong. |
 | `Could not enter the Device Connector scope`                  | The script tried `device-connector`, `cimc/device-connector`, and `cloud`. Enable it under **Admin → Device Connector**. |
