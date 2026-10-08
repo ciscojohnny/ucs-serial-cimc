@@ -28,9 +28,10 @@
         host:port, and http://host:port all return ISO Mapping Error with no
         download). Unmap every existing volume, map the virtual DVD with a
         separate remote share and remote file, then arm the update with
-        bootMedium vmedia and no share address. A share of NA is mapped on
-        reboot, the job becomes ISO Mapping Error, and the ISO stops on the
-        license screen. The host boots only after that arm is accepted, and
+        bootMedium vmedia and the laptop address with its port. An empty
+        remoteIp is rejected, so the host is not rebooted. A share of NA is
+        mapped on reboot and the ISO stops on the license screen. The host
+        boots only after that arm is accepted, and
         the ISO accepts the license. The HUU
         object rejects a remoteFile attribute. 6.0 unmaps and lets its HUU
         job mount the ISO itself.
@@ -2095,10 +2096,9 @@ function New-CimcHuuTriggerBody {
     # on this object. The ISO name goes on the vMedia map instead.
     $location = ''
     if ($MappedMedium) {
-        # "NA" is a share address. On reboot CIMC tries to map it, the job
-        # becomes ISO Mapping Error, and the ISO opens the license screen.
-        if (-not $OmitShare) { $location = ' remoteIp="NA" remoteShare="NA"' }
-        $location += ' bootMedium="vmedia"'
+        # bootMedium vmedia rejects an empty remoteIp. A placeholder such as
+        # NA is mapped on reboot and the ISO then stops on the license screen.
+        $location = " remoteIp=`"$(ConvertTo-CimcXmlValue $RemoteIp)`" remoteShare=`"$(ConvertTo-CimcXmlValue $RemoteShare)`" bootMedium=`"vmedia`""
         if ($Delayed) { $location += ' updateType="delay" doForceDown="no"' }
         else { $location += ' updateType="immediate" doForceDown="yes" gracefulTimeout="3"' }
     }
@@ -2126,6 +2126,8 @@ function Start-CimcNonInteractiveHuu {
         [Parameter(Mandatory)][string]$CimcIp,
         [string]$ShareUser,
         [string]$SharePass,
+        [string]$RemoteIp,
+        [string]$RemoteShare,
         [Parameter(Mandatory)][object]$Fw
     )
     $component = if ($Fw.updateComponent) { [string]$Fw.updateComponent } else { 'all' }
@@ -2151,17 +2153,21 @@ function Start-CimcNonInteractiveHuu {
     }
     $prior = Get-CimcHuuStatus -CimcIp $CimcIp -Cookie $cookie
     Write-Log "Arming the non-interactive update for '$component' from the mapped virtual DVD. The ISO accepts the license and updates every component except the drives."
-    # No share address. A placeholder share is mapped on reboot and the ISO
-    # then stops on the license screen. Immediate lets CIMC boot the DVD.
+    # vmedia boot medium requires a remote IP. Immediate tells CIMC to reboot
+    # the host into that DVD. The http:// form is the second try.
+    $httpIp = $RemoteIp
+    if ($RemoteIp -and $RemoteIp -notmatch '^[a-z]+://') { $httpIp = "http://$RemoteIp" }
     $forms = @(
-        [pscustomobject]@{ OmitShare = $true; Delayed = $false; Label = 'immediate boot of the mapped DVD' },
-        [pscustomobject]@{ OmitShare = $true; Delayed = $true; Label = 'delayed boot of the mapped DVD' }
+        [pscustomobject]@{ Ip = $RemoteIp; Share = $RemoteShare; Delayed = $false; Label = "$RemoteIp$RemoteShare" },
+        [pscustomobject]@{ Ip = $httpIp; Share = $RemoteShare; Delayed = $false; Label = "$httpIp$RemoteShare" },
+        [pscustomobject]@{ Ip = $RemoteIp; Share = $RemoteShare; Delayed = $true; Label = "$RemoteIp$RemoteShare on the next reboot" }
     )
     foreach ($form in $forms) {
+        if (-not $form.Ip) { continue }
         Write-Log "Requesting the non-interactive update ($($form.Label))."
-        $body = New-CimcHuuTriggerBody -Cookie $cookie -RemoteIp 'NA' -RemoteShare 'NA' `
+        $body = New-CimcHuuTriggerBody -Cookie $cookie -RemoteIp $form.Ip -RemoteShare $form.Share `
             -ShareUser $ShareUser -SharePass $SharePass -Component $component -TimeoutMin $timeoutMin `
-            -MappedMedium -OmitShare:$form.OmitShare -Delayed:$form.Delayed
+            -MappedMedium -Delayed:$form.Delayed
         $trigger = Send-CimcXmlRequest -CimcIp $CimcIp -Body $body -TimeoutSec 180
         if ($trigger -match 'errorCode="([^"]+)"' -and $Matches[1]) {
             $why = ([regex]::Match($trigger, 'errorDescr="([^"]*)"')).Groups[1].Value
@@ -2956,6 +2962,7 @@ function Invoke-FirmwareUpgrade {
         $huuError = $null
         $xmlMapped = $false
         $bootOrderSet = $false
+        $hostBooted = $false
         $mediaUpgraded = $false
         # Every firmware path starts by dropping maps left from an earlier run.
         # 4.3 then maps the new ISO. 6.0 leaves the map empty and lets the HUU
@@ -3039,8 +3046,10 @@ function Invoke-FirmwareUpgrade {
                     $armed = $null
                     if ($bootOrderSet) {
                         try {
+                            $armIp = if ($serveHost) { "${serveHost}:$listenPort" } else { $share.Host }
                             $armed = Start-CimcNonInteractiveHuu -CimcIp $TargetIp `
-                                -ShareUser ([string]$fw.shareUser) -SharePass ([string]$fw.sharePassword) -Fw $fw
+                                -ShareUser ([string]$fw.shareUser) -SharePass ([string]$fw.sharePassword) `
+                                -RemoteIp $armIp -RemoteShare "/$isoFile" -Fw $fw
                         }
                         catch {
                             Write-Log -Level WARN "Could not arm the non-interactive update: $($_.Exception.Message)"
@@ -3055,9 +3064,15 @@ function Invoke-FirmwareUpgrade {
                             }
                         }
                     }
-                    if ($bootOrderSet -and $powerCyc -and $armed -and -not $armed.ForceDown) {
+                    $hostBooted = $false
+                    if ($armed -and $armed.ForceDown) {
+                        $hostBooted = $true
+                        Write-Log 'CIMC is rebooting the host into the mapped ISO as part of the update.'
+                    }
+                    elseif ($bootOrderSet -and $powerCyc -and $armed) {
                         try {
-                            if (-not (Invoke-CimcHostPowerXml -CimcIp $TargetIp)) { $bootOrderSet = $false }
+                            $hostBooted = [bool](Invoke-CimcHostPowerXml -CimcIp $TargetIp)
+                            if (-not $hostBooted) { $bootOrderSet = $false }
                         }
                         catch {
                             Write-Log -Level WARN "Could not power-cycle the host over HTTPS: $($_.Exception.Message)"
@@ -3105,12 +3120,12 @@ function Invoke-FirmwareUpgrade {
             }
             elseif ($server) {
                 Write-Host ''
-                if ($bootOrderSet) {
+                if ($hostBooted) {
                     Write-Host "The host was booted, but the non-interactive update did not stay armed." -ForegroundColor Yellow
                     Write-Host "The license screen will not continue on its own. Press Enter to stop the ISO server." -ForegroundColor Yellow
                 } else {
-                    Write-Host "Automatic HUU did not start, and the serial console stopped answering." -ForegroundColor Yellow
-                    Write-Host "In CIMC, boot the mapped vDVD, then choose Update and Activate for all components." -ForegroundColor Yellow
+                    Write-Host "The non-interactive update was rejected, so the host was not rebooted." -ForegroundColor Yellow
+                    Write-Host "Press Enter to stop the ISO server." -ForegroundColor Yellow
                 }
                 Write-Host "The local HTTP server must stay running while the CIMC reads the ISO." -ForegroundColor Yellow
                 Write-Host "Press Enter here ONLY when the upgrade is complete to stop serving the ISO..." -ForegroundColor Yellow
