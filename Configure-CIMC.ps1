@@ -24,8 +24,11 @@
       Device Connector is already enabled. This script does not change it.
       HUU www map: 6.0 takes one location, remoteIp "http://host:port" and
         remoteShare "/file.iso", and that job accepts the license itself.
-        4.3 keeps remote share and remote file separate on the vMedia map.
-        Unmap every existing vMedia volume, map the new ISO, arm a delayed
+        4.3 HUU takes remoteIp as a plain IP and reads http://<ip>/<file> on
+        port 80, so a second listener serves the ISO on port 80 and the HUU
+        job runs unattended (it accepts the license itself). Only if that
+        fails: 4.3 keeps remote share and remote file separate on the vMedia
+        map. Unmap every existing vMedia volume, map the new ISO, arm a delayed
         non-interactive update, put the CIMC-mapped DVD first, and
         power-cycle. The ISO then accepts the license and updates. The HUU
         object rejects a remoteFile attribute. 6.0 unmaps and lets its HUU
@@ -1447,12 +1450,15 @@ server.serve_forever()
     $logPath = $script:SessionLog
     # CIMC reads the ISO in thousands of byte-range requests. Keep the first
     # request from each client, every error, and one summary a minute.
-    $script:HttpLogState = [hashtable]::Synchronized(@{
-        LogPath = $logPath
-        Hits    = 0
-        Last    = [datetime]::UtcNow
-        Seen    = '|'
-    })
+    # A second listener (port 80 for the 4.3 HUU job) shares the same counters.
+    if (-not $script:HttpLogState) {
+        $script:HttpLogState = [hashtable]::Synchronized(@{
+            LogPath = $logPath
+            Hits    = 0
+            Last    = [datetime]::UtcNow
+            Seen    = '|'
+        })
+    }
     foreach ($evt in @('OutputDataReceived','ErrorDataReceived')) {
         Register-ObjectEvent -InputObject $proc -EventName $evt -MessageData $script:HttpLogState `
             -SourceIdentifier ("CimcHttp{0}{1}" -f $evt, $proc.Id) -Action {
@@ -2562,7 +2568,8 @@ function Invoke-CimcHuuUpgrade {
         [string]$MapRetryShare,
         [string]$ShareDir,
         [string]$RemoteFile,
-        [Parameter(Mandatory)][object]$Fw
+        [Parameter(Mandatory)][object]$Fw,
+        [switch]$Legacy
     )
     $component = if ($Fw.updateComponent) { [string]$Fw.updateComponent } else { 'all' }
     $timeoutMin = if ($Fw.updateTimeoutMin) { [int]$Fw.updateTimeoutMin } else { 240 }
@@ -2578,7 +2585,7 @@ function Invoke-CimcHuuUpgrade {
     $oldOverall = [string]$prior.Overall
 
     $body = New-CimcHuuTriggerBody -Cookie $cookie -RemoteIp $RemoteIp -RemoteShare $RemoteShare `
-        -ShareUser $ShareUser -SharePass $SharePass -Component $component -TimeoutMin $timeoutMin
+        -ShareUser $ShareUser -SharePass $SharePass -Component $component -TimeoutMin $timeoutMin -Legacy:$Legacy
     Write-Log "Starting HUU update and activate for '$component' from $RemoteIp$RemoteShare. CIMC allows up to $timeoutMin minutes. Leave this window open."
     Write-Host ''
     Write-Host "HUU is updating and activating every component except the drives. This often takes one to three hours." -ForegroundColor Yellow
@@ -2823,6 +2830,8 @@ function Invoke-FirmwareUpgrade {
     if (-not $isoFile) { throw 'Firmware step is enabled but no ISO file name was provided (firmware.isoFile or -IsoFile).' }
 
     $server = $null
+    $server80 = $null
+    $serveHost = $null
     try {
         if ($transport -ieq 'http-local') {
             if (-not $isoFolder) { throw 'firmware.transport is "http-local" but no folder was provided (firmware.isoFolder or -IsoFolder).' }
@@ -2920,6 +2929,47 @@ function Invoke-FirmwareUpgrade {
         if ($script:CimcXmlVersion) { Write-Log "CIMC firmware version $($script:CimcXmlVersion)." }
         else { Write-Log -Level WARN 'CIMC did not report a firmware version. The HUU job will mount the ISO.' }
         $useMappedDvd = $script:CimcXmlVersion -match '^4\.'
+        if ($useMappedDvd -and $serveHost) {
+            # 4.3 HUU takes remoteIp as a plain IP and fetches http://<ip>/<file>
+            # on port 80. A port in that field fails with ISO Mapping Error, and
+            # without a valid HUU job the booted ISO stops at the license screen.
+            # With the job, CIMC mounts and boots the ISO, the ISO accepts the
+            # license, and it updates and activates on its own.
+            $port80Ok = $false
+            if ($listenPort -eq 80) { $port80Ok = $true }
+            else {
+                try {
+                    Write-Log 'CIMC 4.3 reads the HUU ISO on port 80. Starting a second HTTP listener on port 80.'
+                    Add-IsoHttpFirewallRule -ListenPort 80 -Program (Resolve-PythonCommand).Source
+                    $server80 = Start-IsoHttpServer -Folder $isoFolder -ListenPort 80 -BindAddress '0.0.0.0'
+                    $port80Ok = Test-IsoHttpReachable -Url ("http://{0}/{1}" -f $serveHost, $isoFile) -Range
+                    if (-not $port80Ok) {
+                        Write-Log -Level WARN "This laptop cannot read http://$serveHost/$isoFile. Windows may be blocking inbound TCP 80. Run PowerShell as Administrator."
+                    }
+                }
+                catch {
+                    Write-Log -Level WARN "Could not serve the ISO on port 80: $($_.Exception.Message). Close anything else using port 80 (IIS, another web server) to let CIMC run the update unattended."
+                }
+            }
+            if ($port80Ok) {
+                try {
+                    Invoke-CimcHuuUpgrade -CimcIp $TargetIp -RemoteIp $serveHost -RemoteShare "/$isoFile" `
+                        -ShareUser ([string]$fw.shareUser) -SharePass ([string]$fw.sharePassword) -Fw $fw -Legacy
+                    $upgraded = $true
+                }
+                catch {
+                    $huuError = $_.Exception.Message
+                    if ($script:CimcPassword -and $huuError.Contains($script:CimcPassword)) { $huuError = $huuError.Replace($script:CimcPassword, '<redacted>') }
+                    Write-Log -Level WARN "Automatic HUU update on port 80 did not finish: $huuError"
+                    if ($script:HuuJobStarted -and $huuError -notmatch '(?i)ISO Mapping Error') { throw $huuError }
+                    try { Clear-CimcWwwVolumes -CimcIp $TargetIp -Volume $volume }
+                    catch { Write-Log -Level WARN "Could not clear the vMedia map before the fallback: $($_.Exception.Message)" }
+                }
+            }
+            if (-not $upgraded) {
+                Write-Log -Level WARN 'Falling back to mapping the ISO and booting the CIMC-mapped DVD. The ISO may stop at the license screen.'
+            }
+        }
         if (-not $useMappedDvd) {
             try {
                 Invoke-CimcHuuUpgrade -CimcIp $TargetIp -RemoteIp $share.Ip -RemoteShare $share.Share `
@@ -3061,6 +3111,7 @@ function Invoke-FirmwareUpgrade {
         if ($TargetIp) {
             try { Disconnect-CimcXml -CimcIp $TargetIp } catch {}
         }
+        if ($server80) { Stop-IsoHttpServer -Proc $server80 }
         if ($server) { Stop-IsoHttpServer -Proc $server }
     }
 }
