@@ -2157,10 +2157,12 @@ function Start-CimcNonInteractiveHuu {
     # the host into that DVD. The http:// form is the second try.
     $httpIp = $RemoteIp
     if ($RemoteIp -and $RemoteIp -notmatch '^[a-z]+://') { $httpIp = "http://$RemoteIp" }
+    # The delayed form is the one that reaches "NIHUU pending". The immediate
+    # forms return ISO Mapping Error on this firmware and are only a fallback.
     $forms = @(
+        [pscustomobject]@{ Ip = $RemoteIp; Share = $RemoteShare; Delayed = $true; Label = "$RemoteIp$RemoteShare on the next reboot" },
         [pscustomobject]@{ Ip = $RemoteIp; Share = $RemoteShare; Delayed = $false; Label = "$RemoteIp$RemoteShare" },
-        [pscustomobject]@{ Ip = $httpIp; Share = $RemoteShare; Delayed = $false; Label = "$httpIp$RemoteShare" },
-        [pscustomobject]@{ Ip = $RemoteIp; Share = $RemoteShare; Delayed = $true; Label = "$RemoteIp$RemoteShare on the next reboot" }
+        [pscustomobject]@{ Ip = $httpIp; Share = $RemoteShare; Delayed = $false; Label = "$httpIp$RemoteShare" }
     )
     foreach ($form in $forms) {
         if (-not $form.Ip) { continue }
@@ -2211,7 +2213,16 @@ function Wait-CimcHuuJob {
         [string]$OldStart,
         [string]$OldOverall,
         [Parameter(Mandatory)][int]$TimeoutMin,
-        [int]$IdleLimitMin = 0
+        [int]$IdleLimitMin = 0,
+        # After the host reboots, CIMC tries to map the share again, fails, and
+        # drops "NIHUU pending" before the ISO looks for it. Put the pending
+        # update back each time that happens.
+        [string]$RearmIp,
+        [string]$RearmShare,
+        [string]$RearmUser,
+        [string]$RearmPass,
+        [string]$RearmComponent = 'all',
+        [int]$RearmTimeoutMin = 240
     )
     $deadline = (Get-Date).AddMinutes($TimeoutMin + 30)
     $idleStart = Get-Date
@@ -2237,7 +2248,24 @@ function Wait-CimcHuuJob {
         if ($overall -and $overall -ne $OldOverall -and $overall -match '(?i)progress|running|updating|activat|boot|trigger|NIHUU|pending|waiting for host') { $seenActive = $true }
         $stillWaiting = $overall -match '(?i)NIHUU|pending|waiting for host'
         if ($stillWaiting) { $seenActive = $true }
-        if ($overall -match '(?i)mapping error' -and $end -and $end -ne $OldEnd -and -not $stillWaiting) { $seenActive = $true }
+        $mapError = $overall -match '(?i)ISO Mapping Error'
+        if ($mapError -and $RearmIp -and -not $stillWaiting) {
+            if (((Get-Date) - $idleStart).TotalMinutes -ge 15) {
+                throw 'The non-interactive update was cleared on reboot and did not stay pending long enough for the ISO to accept the license.'
+            }
+            Write-Log 'The reboot cleared the pending update. Arming it again so the ISO still sees a non-interactive job.'
+            if (-not $Cookie) { $Cookie = Connect-CimcXml -CimcIp $CimcIp }
+            $again = New-CimcHuuTriggerBody -Cookie $Cookie -RemoteIp $RearmIp -RemoteShare $RearmShare `
+                -ShareUser $RearmUser -SharePass $RearmPass -Component $RearmComponent -TimeoutMin $RearmTimeoutMin `
+                -MappedMedium -Delayed
+            $trigger = Send-CimcXmlRequest -CimcIp $CimcIp -Body $again -TimeoutSec 90
+            if ($trigger -match 'errorCode="([^"]+)"' -and $Matches[1]) {
+                $why = ([regex]::Match($trigger, 'errorDescr="([^"]*)"')).Groups[1].Value
+                Write-Log -Level WARN "Could not re-arm the pending update: $why"
+            }
+            continue
+        }
+        if ($mapError -and $end -and $end -ne $OldEnd -and -not $stillWaiting) { $seenActive = $true }
         $done = 0; $running = 0; $skipped = 0
         foreach ($item in @($status.Components)) {
             if ($item.Update -match '(?i)complete|success') { $done++ }
@@ -3081,8 +3109,11 @@ function Invoke-FirmwareUpgrade {
                     }
                     if ($armed -and $bootOrderSet) {
                         try {
+                            $component = if ($fw.updateComponent) { [string]$fw.updateComponent } else { 'all' }
                             Wait-CimcHuuJob -CimcIp $TargetIp -Cookie $armed.Cookie -OldEnd $armed.OldEnd `
-                                -OldStart $armed.OldStart -OldOverall $armed.OldOverall -TimeoutMin $armed.TimeoutMin -IdleLimitMin 20
+                                -OldStart $armed.OldStart -OldOverall $armed.OldOverall -TimeoutMin $armed.TimeoutMin -IdleLimitMin 20 `
+                                -RearmIp $armIp -RearmShare "/$isoFile" -RearmUser ([string]$fw.shareUser) -RearmPass ([string]$fw.sharePassword) `
+                                -RearmComponent $component -RearmTimeoutMin $armed.TimeoutMin
                             $mediaUpgraded = $true
                         }
                         catch {
