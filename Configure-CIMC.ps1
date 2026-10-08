@@ -28,8 +28,10 @@
         host:port, and http://host:port all return ISO Mapping Error with no
         download). Unmap every existing volume, map the virtual DVD with a
         separate remote share and remote file, then arm the update with
-        bootMedium vmedia and remoteIp/remoteShare NA. The host boots only
-        after that arm is accepted, and the ISO accepts the license. The HUU
+        bootMedium vmedia and no share address. A share of NA is mapped on
+        reboot, the job becomes ISO Mapping Error, and the ISO stops on the
+        license screen. The host boots only after that arm is accepted, and
+        the ISO accepts the license. The HUU
         object rejects a remoteFile attribute. 6.0 unmaps and lets its HUU
         job mount the ISO itself.
       updateComponent "all" skips drives. "all,hdd" includes them.
@@ -2093,8 +2095,12 @@ function New-CimcHuuTriggerBody {
     # on this object. The ISO name goes on the vMedia map instead.
     $location = ''
     if ($MappedMedium) {
+        # "NA" is a share address. On reboot CIMC tries to map it, the job
+        # becomes ISO Mapping Error, and the ISO opens the license screen.
         if (-not $OmitShare) { $location = ' remoteIp="NA" remoteShare="NA"' }
-        $location += ' bootMedium="vmedia" updateType="delay" doForceDown="no"'
+        $location += ' bootMedium="vmedia"'
+        if ($Delayed) { $location += ' updateType="delay" doForceDown="no"' }
+        else { $location += ' updateType="immediate" doForceDown="yes" gracefulTimeout="3"' }
     }
     else {
         $location = " remoteIp=`"$(ConvertTo-CimcXmlValue $RemoteIp)`" remoteShare=`"$(ConvertTo-CimcXmlValue $RemoteShare)`""
@@ -2127,17 +2133,35 @@ function Start-CimcNonInteractiveHuu {
     if ($timeoutMin -lt 30) { $timeoutMin = 30 }
     if ($timeoutMin -gt 240) { $timeoutMin = 240 }
     $cookie = Connect-CimcXml -CimcIp $CimcIp
+    $safeCookie = ConvertTo-CimcXmlValue $cookie
+    $cancel = @"
+<configConfMo cookie="$safeCookie" dn="sys/huu/firmwareUpdateCancel" inHierarchical="false">
+  <inConfig>
+    <huuFirmwareUpdateCancel dn="sys/huu/firmwareUpdateCancel" adminState="trigger" status="modified"/>
+  </inConfig>
+</configConfMo>
+"@
+    $cancelled = Send-CimcXmlRequest -CimcIp $CimcIp -Body $cancel -TimeoutSec 60
+    if ($cancelled -match 'errorCode="([^"]+)"' -and $Matches[1]) {
+        $why = ([regex]::Match($cancelled, 'errorDescr="([^"]*)"')).Groups[1].Value
+        Write-Log "No HUU job was waiting to be cleared ($why)."
+    }
+    else {
+        Write-Log 'Cleared the previous HUU job so it cannot replace the new update.'
+    }
     $prior = Get-CimcHuuStatus -CimcIp $CimcIp -Cookie $cookie
     Write-Log "Arming the non-interactive update for '$component' from the mapped virtual DVD. The ISO accepts the license and updates every component except the drives."
+    # No share address. A placeholder share is mapped on reboot and the ISO
+    # then stops on the license screen. Immediate lets CIMC boot the DVD.
     $forms = @(
-        [pscustomobject]@{ OmitShare = $false; Label = 'boot medium vmedia and no share address' },
-        [pscustomobject]@{ OmitShare = $true; Label = 'boot medium vmedia only' }
+        [pscustomobject]@{ OmitShare = $true; Delayed = $false; Label = 'immediate boot of the mapped DVD' },
+        [pscustomobject]@{ OmitShare = $true; Delayed = $true; Label = 'delayed boot of the mapped DVD' }
     )
     foreach ($form in $forms) {
-        Write-Log "Requesting a delayed update ($($form.Label))."
+        Write-Log "Requesting the non-interactive update ($($form.Label))."
         $body = New-CimcHuuTriggerBody -Cookie $cookie -RemoteIp 'NA' -RemoteShare 'NA' `
             -ShareUser $ShareUser -SharePass $SharePass -Component $component -TimeoutMin $timeoutMin `
-            -MappedMedium -OmitShare:$form.OmitShare
+            -MappedMedium -OmitShare:$form.OmitShare -Delayed:$form.Delayed
         $trigger = Send-CimcXmlRequest -CimcIp $CimcIp -Body $body -TimeoutSec 180
         if ($trigger -match 'errorCode="([^"]+)"' -and $Matches[1]) {
             $why = ([regex]::Match($trigger, 'errorDescr="([^"]*)"')).Groups[1].Value
@@ -2164,7 +2188,7 @@ function Start-CimcNonInteractiveHuu {
             OldStart   = [string]$prior.StartTime
             OldOverall = [string]$prior.Overall
             TimeoutMin = $timeoutMin
-            ForceDown  = $false
+            ForceDown  = -not $form.Delayed
         }
     }
     Write-Log -Level WARN 'CIMC did not accept a non-interactive update from the mapped virtual DVD. The host will not be booted into the license screen.'
@@ -2204,8 +2228,10 @@ function Wait-CimcHuuJob {
         $end = [string]$status.EndTime
         $overall = [string]$status.Overall
         if ($start -and $start -ne $OldStart -and $start -notmatch '^(NA|N/A|none)?$') { $seenActive = $true }
-        if ($overall -and $overall -ne $OldOverall -and $overall -match '(?i)progress|running|updating|activat|boot|trigger') { $seenActive = $true }
-        if ($overall -match '(?i)mapping error' -and $end -and $end -ne $OldEnd) { $seenActive = $true }
+        if ($overall -and $overall -ne $OldOverall -and $overall -match '(?i)progress|running|updating|activat|boot|trigger|NIHUU|pending|waiting for host') { $seenActive = $true }
+        $stillWaiting = $overall -match '(?i)NIHUU|pending|waiting for host'
+        if ($stillWaiting) { $seenActive = $true }
+        if ($overall -match '(?i)mapping error' -and $end -and $end -ne $OldEnd -and -not $stillWaiting) { $seenActive = $true }
         $done = 0; $running = 0; $skipped = 0
         foreach ($item in @($status.Components)) {
             if ($item.Update -match '(?i)complete|success') { $done++ }
@@ -2230,7 +2256,7 @@ function Wait-CimcHuuJob {
             throw "HUU did not accept the license and start the update within $IdleLimitMin minutes."
         }
         $endIsNew = $end -and $end -notmatch '^(NA|N/A|none|null)?$' -and $end -ne $OldEnd
-        if ($seenActive -and $endIsNew) {
+        if ($seenActive -and $endIsNew -and -not $stillWaiting) {
             Write-Log "HUU finished. Image '$($status.Image)'. Overall: $overall"
             $failed = @()
             foreach ($item in @($status.Components)) {
@@ -3029,7 +3055,7 @@ function Invoke-FirmwareUpgrade {
                             }
                         }
                     }
-                    if ($bootOrderSet -and $powerCyc -and $armed) {
+                    if ($bootOrderSet -and $powerCyc -and $armed -and -not $armed.ForceDown) {
                         try {
                             if (-not (Invoke-CimcHostPowerXml -CimcIp $TargetIp)) { $bootOrderSet = $false }
                         }
@@ -3080,9 +3106,8 @@ function Invoke-FirmwareUpgrade {
             elseif ($server) {
                 Write-Host ''
                 if ($bootOrderSet) {
-                    Write-Host "The ISO is mapped and the host is booting it, but the non-interactive update did not start." -ForegroundColor Yellow
-                    Write-Host "On the license screen, click Accept, then Update and Activate for every component except the drives." -ForegroundColor Yellow
-                    Write-Host "Do not press Enter until that update finishes. Enter stops the ISO server." -ForegroundColor Yellow
+                    Write-Host "The host was booted, but the non-interactive update did not stay armed." -ForegroundColor Yellow
+                    Write-Host "The license screen will not continue on its own. Press Enter to stop the ISO server." -ForegroundColor Yellow
                 } else {
                     Write-Host "Automatic HUU did not start, and the serial console stopped answering." -ForegroundColor Yellow
                     Write-Host "In CIMC, boot the mapped vDVD, then choose Update and Activate for all components." -ForegroundColor Yellow
