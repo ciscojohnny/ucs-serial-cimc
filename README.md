@@ -68,7 +68,7 @@ This script talks to standalone CIMC, not UCS Manager. It is tested on a C220 M7
 | --- | --- | --- |
 | Timezone | `timezone-select`. The US list says `Central Time`. | Same command. Older menus say `Central (most areas)`. If the country list returns to the CLI prompt, the script continues and timezone is left for the UI. |
 | HUU / vMedia location | Existing maps are removed. The HUU job then mounts one location: `remoteIp` is `http://host:port` and `remoteShare` is `/file.iso`. | Existing maps are removed first. Remote share and remote file stay separate. The share is `http://host:port/` and the file is the ISO name. The HUU object rejects `remoteFile`. |
-| HUU job | `remoteIp` can include the scheme and port 8000. | `remoteIp` must be a plain IP, and CIMC reads the ISO on port 80. The script adds a port 80 listener (run PowerShell as Administrator so the firewall rule applies, and keep port 80 free), then the HUU job boots the ISO, accepts the license, and updates. |
+| HUU job | `remoteIp` can include the scheme and port 8000. | `remoteIp` is the laptop address and port with no scheme (`host:8000`). A plain IP is read on port 80, and CIMC 4.3 does not open that port. The HUU job then boots the ISO, accepts the license, and updates. |
 | Boot into that ISO | The HUU job boots the ISO, accepts the license, and updates. | Only if the port 80 job fails: after the vMedia map, a delayed non-interactive update is armed, the CIMC-mapped DVD is set first (an existing DVD is reordered, not created again), and the host is power-cycled. The ISO accepts the license and updates. |
 | Drives | `updateComponent` `all` skips drives. | Same token. `all,hdd` is the only value that includes drives. |
 

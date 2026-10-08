@@ -24,10 +24,10 @@
       Device Connector is already enabled. This script does not change it.
       HUU www map: 6.0 takes one location, remoteIp "http://host:port" and
         remoteShare "/file.iso", and that job accepts the license itself.
-        4.3 HUU takes remoteIp as a plain IP and reads http://<ip>/<file> on
-        port 80, so a second listener serves the ISO on port 80 and the HUU
-        job runs unattended (it accepts the license itself). Only if that
-        fails: 4.3 keeps remote share and remote file separate on the vMedia
+        4.3 HUU takes remoteIp as an address with an optional port and no
+        scheme (host:8000), because a plain IP is fetched on port 80 and this
+        CIMC does not open port 80. That job accepts the license itself. Only
+        if it fails: 4.3 keeps remote share and remote file separate on the vMedia
         map. Unmap every existing vMedia volume, map the new ISO, arm a delayed
         non-interactive update, put the CIMC-mapped DVD first, and
         power-cycle. The ISO then accepts the license and updates. The HUU
@@ -2930,40 +2930,46 @@ function Invoke-FirmwareUpgrade {
         else { Write-Log -Level WARN 'CIMC did not report a firmware version. The HUU job will mount the ISO.' }
         $useMappedDvd = $script:CimcXmlVersion -match '^4\.'
         if ($useMappedDvd -and $serveHost) {
-            # 4.3 HUU takes remoteIp as a plain IP and fetches http://<ip>/<file>
-            # on port 80. A port in that field fails with ISO Mapping Error, and
-            # without a valid HUU job the booted ISO stops at the license screen.
-            # With the job, CIMC mounts and boots the ISO, the ISO accepts the
-            # license, and it updates and activates on its own.
-            $port80Ok = $false
-            if ($listenPort -eq 80) { $port80Ok = $true }
-            else {
-                try {
-                    Write-Log 'CIMC 4.3 reads the HUU ISO on port 80. Starting a second HTTP listener on port 80.'
-                    Add-IsoHttpFirewallRule -ListenPort 80 -Program (Resolve-PythonCommand).Source
-                    $server80 = Start-IsoHttpServer -Folder $isoFolder -ListenPort 80 -BindAddress '0.0.0.0'
-                    $port80Ok = Test-IsoHttpReachable -Url ("http://{0}/{1}" -f $serveHost, $isoFile) -Range
-                    if (-not $port80Ok) {
-                        Write-Log -Level WARN "This laptop cannot read http://$serveHost/$isoFile. Windows may be blocking inbound TCP 80. Run PowerShell as Administrator."
+            # A plain IP makes 4.3 fetch the ISO on port 80, and this CIMC never
+            # opened that port. The same CIMC does open the virtual-media port.
+            # remoteIp allows host:port with no scheme. That job is what makes
+            # the ISO accept the license. The mapped DVD is only the fallback.
+            $huuTargets = @(
+                [pscustomobject]@{ Ip = "${serveHost}:$listenPort"; Share = "/$isoFile" }
+            )
+            if ($listenPort -ne 80) {
+                $huuTargets += [pscustomobject]@{ Ip = $serveHost; Share = "/$isoFile"; NeedsPort80 = $true }
+            }
+            foreach ($target in $huuTargets) {
+                if ($upgraded) { break }
+                if ($target.NeedsPort80 -and -not $server80) {
+                    try {
+                        Write-Log 'Trying the HUU ISO on port 80 as well.'
+                        Add-IsoHttpFirewallRule -ListenPort 80 -Program (Resolve-PythonCommand).Source
+                        $server80 = Start-IsoHttpServer -Folder $isoFolder -ListenPort 80 -BindAddress '0.0.0.0'
+                        if (-not (Test-IsoHttpReachable -Url ("http://{0}/{1}" -f $serveHost, $isoFile) -Range)) {
+                            Write-Log -Level WARN "This laptop cannot read http://$serveHost/$isoFile. Skipping the port 80 HUU job."
+                            continue
+                        }
+                    }
+                    catch {
+                        Write-Log -Level WARN "Could not serve the ISO on port 80: $($_.Exception.Message)"
+                        continue
                     }
                 }
-                catch {
-                    Write-Log -Level WARN "Could not serve the ISO on port 80: $($_.Exception.Message). Close anything else using port 80 (IIS, another web server) to let CIMC run the update unattended."
-                }
-            }
-            if ($port80Ok) {
                 try {
-                    Invoke-CimcHuuUpgrade -CimcIp $TargetIp -RemoteIp $serveHost -RemoteShare "/$isoFile" `
+                    Write-Log "CIMC $($script:CimcXmlVersion) HUU address $($target.Ip), share $($target.Share)."
+                    Invoke-CimcHuuUpgrade -CimcIp $TargetIp -RemoteIp $target.Ip -RemoteShare $target.Share `
                         -ShareUser ([string]$fw.shareUser) -SharePass ([string]$fw.sharePassword) -Fw $fw -Legacy
                     $upgraded = $true
                 }
                 catch {
                     $huuError = $_.Exception.Message
                     if ($script:CimcPassword -and $huuError.Contains($script:CimcPassword)) { $huuError = $huuError.Replace($script:CimcPassword, '<redacted>') }
-                    Write-Log -Level WARN "Automatic HUU update on port 80 did not finish: $huuError"
+                    Write-Log -Level WARN "Automatic HUU update from $($target.Ip) did not finish: $huuError"
                     if ($script:HuuJobStarted -and $huuError -notmatch '(?i)ISO Mapping Error') { throw $huuError }
                     try { Clear-CimcWwwVolumes -CimcIp $TargetIp -Volume $volume }
-                    catch { Write-Log -Level WARN "Could not clear the vMedia map before the fallback: $($_.Exception.Message)" }
+                    catch { Write-Log -Level WARN "Could not clear the vMedia map before the next attempt: $($_.Exception.Message)" }
                 }
             }
             if (-not $upgraded) {
@@ -3027,7 +3033,9 @@ function Invoke-FirmwareUpgrade {
                     $armed = $null
                     if ($bootOrderSet) {
                         try {
-                            $armed = Start-CimcNonInteractiveHuu -CimcIp $TargetIp -RemoteIp $share.Ip -RemoteShare $share.Share `
+                            $armIp = if ($serveHost) { "${serveHost}:$listenPort" } else { $share.Ip }
+                            $armShare = if ($serveHost) { "/$isoFile" } else { $share.Share }
+                            $armed = Start-CimcNonInteractiveHuu -CimcIp $TargetIp -RemoteIp $armIp -RemoteShare $armShare `
                                 -ShareUser ([string]$fw.shareUser) -SharePass ([string]$fw.sharePassword) -Fw $fw
                         }
                         catch {
