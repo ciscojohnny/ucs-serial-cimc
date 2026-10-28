@@ -9,11 +9,16 @@
     Order of operations:
         1. Log in. Change the admin password only if CIMC is still at factory default.
         2. Set NIC mode, static IPv4, DNS, hostname, and DNS domain.
+           An APIC-M4 entry is forced to dedicated mode with no NIC redundancy.
         3. Enable NTP, load the NTP servers, and set the timezone.
-        4. If firmware.enabled is true (or -Firmware is passed), serve the HUU
+        4. Apply the server role. "ucs" (the default) stops here. "sns-3655"
+           uses the same CIMC settings and leaves RAID and secure boot alone.
+           "apic-m4" disables LLDP on each VIC and enables BIOS TPM support.
+        5. If firmware.enabled is true (or -Firmware is passed), serve the HUU
            ISO and have CIMC update and activate every component except the
-           drives. CIMC boots the ISO as part of that job. Otherwise reboot
-           the host at the end so the new settings take effect.
+           drives. CIMC boots the ISO as part of that job. A configuration-only
+           run does not reboot the host. After an APIC-M4 upgrade, TPM support
+           and LLDP are set again when the serial CLI comes back.
 
 .NOTES
     Standalone CIMC only (not UCS Manager). Tested on C220 M7S with CIMC 6.0
@@ -200,6 +205,12 @@ function Read-CimcConfig {
         }
         if (-not $seenHostNames.Add($s.hostName.Trim())) {
             throw "Duplicate hostName '$($s.hostName)' in config. Each hostName must be unique."
+        }
+        if ($s.PSObject.Properties.Name -contains 'role' -and -not [string]::IsNullOrWhiteSpace([string]$s.role)) {
+            $roleName = ([string]$s.role).Trim().ToLowerInvariant()
+            if ($roleName -notin @('ucs', 'sns-3655', 'apic-m4')) {
+                throw "Server entry #$idx (hostName='$($s.hostName)') role '$($s.role)' is not supported. Use ucs, sns-3655, or apic-m4."
+            }
         }
         $idx++
     }
@@ -956,6 +967,289 @@ function Set-CimcNtp {
         }
     }
     Write-Log 'NTP configured.'
+}
+
+function Get-CimcServerRole {
+    # Missing role stays on the UCS node path. Appliance steps run only when
+    # the server entry names sns-3655 or apic-m4.
+    param([Parameter(Mandatory)][object]$Server)
+    if (-not ($Server.PSObject.Properties.Name -contains 'role')) { return 'ucs' }
+    $roleName = ([string]$Server.role).Trim().ToLowerInvariant()
+    if (-not $roleName) { return 'ucs' }
+    return $roleName
+}
+
+function Set-ApicCimcNicPolicy {
+    # APIC fabric discovery fails when CIMC management is not dedicated.
+    param([Parameter(Mandatory)][object]$Config)
+    $site = $Config.site
+    $mode = [string]$site.nicMode
+    $redundancy = [string]$site.nicRedundancy
+    if ($mode -eq 'dedicated' -and $redundancy -eq 'none') { return }
+    Write-Log -Level WARN "APIC-M4 CIMC supports only NIC mode dedicated and redundancy none. Using those instead of '$mode' / '$redundancy'."
+    $site.nicMode = 'dedicated'
+    $site.nicRedundancy = 'none'
+}
+
+function Send-CimcSave {
+    # Save a BIOS or adapter change. A prompt that would reboot the host is
+    # answered no. Other confirmations are accepted.
+    param(
+        [Parameter(Mandatory)][System.IO.Ports.SerialPort]$Port,
+        [int]$TimeoutSec = 30,
+        [int]$InterDelayMs = 250
+    )
+    $resp = Send-Command -Port $Port -Command 'commit' `
+        -ExpectPatterns @($script:RxCli, $script:RxConfirm) `
+        -TimeoutSec $TimeoutSec -InterDelayMs $InterDelayMs
+    $n = 5
+    while ($resp -match $script:RxConfirm -and $resp -notmatch $script:RxCli -and $n -gt 0) {
+        if ($resp -match '(?i)reboot.*(now|immediately)') {
+            Write-Log 'Answering no to a host reboot prompt. The change stays pending until the next boot.'
+            $answer = 'n'
+        }
+        else {
+            Write-Log 'Confirming the save prompt with "y".'
+            $answer = 'y'
+        }
+        $resp = Send-Command -Port $Port -Command $answer `
+            -ExpectPatterns @($script:RxCli, $script:RxConfirm) `
+            -TimeoutSec $TimeoutSec -InterDelayMs $InterDelayMs
+        $n--
+    }
+    return $resp
+}
+
+function Get-CimcProductId {
+    param(
+        [Parameter(Mandatory)][System.IO.Ports.SerialPort]$Port,
+        [int]$TimeoutSec = 20,
+        [int]$InterDelayMs = 250
+    )
+    Send-Command -Port $Port -Command 'top' -TimeoutSec $TimeoutSec -InterDelayMs $InterDelayMs | Out-Null
+    Send-Command -Port $Port -Command 'scope chassis' -TimeoutSec $TimeoutSec -InterDelayMs $InterDelayMs | Out-Null
+    $detail = Send-Command -Port $Port -Command 'show detail' -TimeoutSec $TimeoutSec -InterDelayMs $InterDelayMs
+    $pid = [regex]::Match($detail, '(?im)^\s*(?:PID|Product ID)\s*:\s*(\S+)')
+    if ($pid.Success) { return $pid.Groups[1].Value }
+    $name = [regex]::Match($detail, '(?im)^\s*Product Name\s*:\s*(.+)$')
+    if ($name.Success) { return $name.Groups[1].Value.Trim() }
+    return ''
+}
+
+function Test-CimcAppliancePid {
+    param(
+        [Parameter(Mandatory)][System.IO.Ports.SerialPort]$Port,
+        [Parameter(Mandatory)][string]$Role,
+        [int]$TimeoutSec = 20,
+        [int]$InterDelayMs = 250
+    )
+    $productId = ''
+    try {
+        $productId = Get-CimcProductId -Port $Port -TimeoutSec $TimeoutSec -InterDelayMs $InterDelayMs
+    }
+    catch {
+        Write-Log -Level WARN "Could not read the chassis product id: $($_.Exception.Message)"
+        Restore-CimcCli -Port $Port | Out-Null
+        return
+    }
+    if ($productId) { Write-Log "Chassis product id: $productId" }
+    else { Write-Log -Level WARN 'Chassis product id was not in show detail.' }
+    switch ($Role) {
+        'sns-3655' {
+            if ($productId -and $productId -notmatch '(?i)SNS-3655') {
+                Write-Log -Level WARN "role is sns-3655, but the chassis product id is '$productId'. The SNS notes still apply."
+            }
+        }
+        'apic-m4' {
+            if ($productId -and $productId -notmatch '(?i)APIC') {
+                Write-Log -Level WARN "role is apic-m4, but the chassis product id is '$productId'. The APIC-M4 CIMC profile is still applied."
+            }
+        }
+        default {
+            if ($productId -match '(?i)SNS-3655|APIC') {
+                Write-Log -Level WARN "Chassis product id '$productId' is an appliance. Set role to sns-3655 or apic-m4 to apply that profile. This run continues as a UCS node."
+            }
+        }
+    }
+}
+
+function Disable-CimcAdapterLldp {
+    # APIC requires LLDP disabled on the VIC. The host must be powered on for
+    # adapter commands. The change itself does not reboot the host.
+    param(
+        [Parameter(Mandatory)][System.IO.Ports.SerialPort]$Port,
+        [int]$TimeoutSec = 20,
+        [int]$InterDelayMs = 250
+    )
+    Send-Command -Port $Port -Command 'top' -TimeoutSec $TimeoutSec -InterDelayMs $InterDelayMs | Out-Null
+    $chassis = Send-Command -Port $Port -Command 'scope chassis' -TimeoutSec $TimeoutSec -InterDelayMs $InterDelayMs
+    if ($chassis -match '(?i)invalid command') {
+        Write-Log -Level WARN 'scope chassis was rejected. VIC LLDP was not changed.'
+        return
+    }
+    $list = Send-Command -Port $Port -Command 'show adapter' -TimeoutSec $TimeoutSec -InterDelayMs $InterDelayMs
+    if ($list -match '(?i)powered off|power is off') {
+        Write-Log -Level WARN 'The host is powered off, so VIC LLDP cannot be changed. Power it on and run this host again.'
+        return
+    }
+    $slots = @()
+    foreach ($line in ($list -split '\r?\n')) {
+        if ($line -match '^\s*(\d+|[Mm]|mLOM)\s+\S') { $slots += $Matches[1] }
+    }
+    if ($slots.Count -eq 0) {
+        Write-Log -Level WARN 'No VIC adapter was listed. LLDP was not changed.'
+        return
+    }
+    foreach ($slot in $slots) {
+        Write-Log "Checking LLDP on adapter slot $slot."
+        $scope = Send-Command -Port $Port -Command "scope adapter $slot" `
+            -ExpectPatterns @('#\s*$', '(?i)invalid|error') -TimeoutSec $TimeoutSec -InterDelayMs $InterDelayMs
+        if ($scope -match '(?i)invalid|error') {
+            Write-Log -Level WARN "Could not enter adapter slot ${slot}: $($scope -replace '[\r\n]+',' ')"
+            Send-Command -Port $Port -Command 'top' -TimeoutSec $TimeoutSec -InterDelayMs $InterDelayMs | Out-Null
+            Send-Command -Port $Port -Command 'scope chassis' -TimeoutSec $TimeoutSec -InterDelayMs $InterDelayMs | Out-Null
+            continue
+        }
+        $detail = Send-Command -Port $Port -Command 'show detail' -TimeoutSec $TimeoutSec -InterDelayMs $InterDelayMs
+        if ($detail -match '(?im)LLDP:\s*Disabled') {
+            Write-Log "LLDP is already disabled on adapter slot $slot."
+        }
+        else {
+            $set = Send-Command -Port $Port -Command 'set lldp disable' `
+                -ExpectPatterns @('#\s*$', '(?i)invalid|error') -TimeoutSec $TimeoutSec -InterDelayMs $InterDelayMs
+            if ($set -match '(?i)invalid|unrecognized') {
+                $set = Send-Command -Port $Port -Command 'set lldp disabled' `
+                    -ExpectPatterns @('#\s*$', '(?i)invalid|error') -TimeoutSec $TimeoutSec -InterDelayMs $InterDelayMs
+            }
+            if ($set -match '(?i)invalid|unrecognized|error') {
+                Write-Log -Level WARN "Could not disable LLDP on adapter slot ${slot}: $($set -replace '[\r\n]+',' ')"
+            }
+            else {
+                $saved = Send-CimcSave -Port $Port -TimeoutSec 30 -InterDelayMs $InterDelayMs
+                if ($saved -match '(?i)invalid|error|failed') {
+                    Write-Log -Level WARN "LLDP save was not accepted on adapter slot ${slot}: $($saved -replace '[\r\n]+',' ')"
+                }
+                else {
+                    Write-Log "LLDP disabled on adapter slot $slot. It takes effect the next time the host boots."
+                }
+            }
+        }
+        Send-Command -Port $Port -Command 'top' -TimeoutSec $TimeoutSec -InterDelayMs $InterDelayMs | Out-Null
+        Send-Command -Port $Port -Command 'scope chassis' -TimeoutSec $TimeoutSec -InterDelayMs $InterDelayMs | Out-Null
+    }
+}
+
+function Enable-CimcTpmSupport {
+    # Enable TPM support only. Do not clear the TPM or take ownership. The
+    # APIC operating system takes ownership after the host boots.
+    param(
+        [Parameter(Mandatory)][System.IO.Ports.SerialPort]$Port,
+        [int]$TimeoutSec = 20,
+        [int]$InterDelayMs = 250
+    )
+    Send-Command -Port $Port -Command 'top' -TimeoutSec $TimeoutSec -InterDelayMs $InterDelayMs | Out-Null
+    $bios = Send-Command -Port $Port -Command 'scope bios' `
+        -ExpectPatterns @('#\s*$', '(?i)invalid') -TimeoutSec $TimeoutSec -InterDelayMs $InterDelayMs
+    if ($bios -match '(?i)invalid command') {
+        Write-Log -Level WARN 'scope bios was rejected. TPM support was not changed.'
+        return
+    }
+    $main = Send-Command -Port $Port -Command 'scope main' `
+        -ExpectPatterns @('#\s*$', '(?i)invalid') -TimeoutSec $TimeoutSec -InterDelayMs $InterDelayMs
+    if ($main -notmatch '(?i)invalid command') {
+        $detail = Send-Command -Port $Port -Command 'show detail' -TimeoutSec $TimeoutSec -InterDelayMs $InterDelayMs
+        if ($detail -match '(?im)TPM Support:\s*Enabled') {
+            Write-Log 'BIOS TPM support is already enabled.'
+            return
+        }
+        $set = Send-Command -Port $Port -Command 'set TPMSupport Enabled' `
+            -ExpectPatterns @('#\s*$', '(?i)invalid|error') -TimeoutSec $TimeoutSec -InterDelayMs $InterDelayMs
+        if ($set -match '(?i)invalid|unrecognized') {
+            $set = Send-Command -Port $Port -Command 'set TpmSupport Enabled' `
+                -ExpectPatterns @('#\s*$', '(?i)invalid|error') -TimeoutSec $TimeoutSec -InterDelayMs $InterDelayMs
+        }
+        if ($set -notmatch '(?i)invalid|unrecognized|error') {
+            $saved = Send-CimcSave -Port $Port -TimeoutSec 30 -InterDelayMs $InterDelayMs
+            if ($saved -match '(?i)invalid|error|failed') {
+                Write-Log -Level WARN "BIOS TPM save was not accepted: $($saved -replace '[\r\n]+',' ')"
+            }
+            else {
+                Write-Log 'BIOS TPM support set to Enabled. It applies on the next host boot.'
+            }
+            return
+        }
+    }
+    Send-Command -Port $Port -Command 'top' -TimeoutSec $TimeoutSec -InterDelayMs $InterDelayMs | Out-Null
+    Send-Command -Port $Port -Command 'scope bios' -TimeoutSec $TimeoutSec -InterDelayMs $InterDelayMs | Out-Null
+    $mgmt = Send-Command -Port $Port -Command 'scope server-management' `
+        -ExpectPatterns @('#\s*$', '(?i)invalid') -TimeoutSec $TimeoutSec -InterDelayMs $InterDelayMs
+    if ($mgmt -match '(?i)invalid command') {
+        Write-Log -Level WARN 'This CIMC did not accept a TPM support token. Enable TPM Support in the CIMC BIOS screen.'
+        Restore-CimcCli -Port $Port | Out-Null
+        return
+    }
+    $control = Send-Command -Port $Port -Command 'set TPMControl Enabled' `
+        -ExpectPatterns @('#\s*$', '(?i)invalid|error') -TimeoutSec $TimeoutSec -InterDelayMs $InterDelayMs
+    $support = Send-Command -Port $Port -Command 'set TpmSupport Enabled' `
+        -ExpectPatterns @('#\s*$', '(?i)invalid|error') -TimeoutSec $TimeoutSec -InterDelayMs $InterDelayMs
+    if ($control -match '(?i)invalid|unrecognized|error' -and $support -match '(?i)invalid|unrecognized|error') {
+        Write-Log -Level WARN 'This CIMC did not accept TPMControl or TpmSupport. Enable TPM Support in the CIMC BIOS screen.'
+        return
+    }
+    $saved = Send-CimcSave -Port $Port -TimeoutSec 30 -InterDelayMs $InterDelayMs
+    if ($saved -match '(?i)invalid|error|failed') {
+        Write-Log -Level WARN "BIOS TPM save was not accepted: $($saved -replace '[\r\n]+',' ')"
+    }
+    else {
+        Write-Log 'BIOS TPM support set to Enabled. It applies on the next host boot.'
+    }
+}
+
+function Invoke-CimcApplianceProfile {
+    param(
+        [Parameter(Mandatory)][System.IO.Ports.SerialPort]$Port,
+        [Parameter(Mandatory)][object]$Config,
+        [Parameter(Mandatory)][object]$Server,
+        [switch]$AfterFirmware
+    )
+    $role = Get-CimcServerRole -Server $Server
+    $cmdTO = [int]$Config.behavior.commandTimeoutSec
+    $delayMs = [int]$Config.behavior.interCommandDelayMs
+    if ($role -eq 'ucs') {
+        if (-not $AfterFirmware) {
+            Test-CimcAppliancePid -Port $Port -Role $role -TimeoutSec $cmdTO -InterDelayMs $delayMs
+        }
+        return
+    }
+    if (-not $AfterFirmware) {
+        Test-CimcAppliancePid -Port $Port -Role $role -TimeoutSec $cmdTO -InterDelayMs $delayMs
+    }
+    if ($role -eq 'sns-3655') {
+        if ($AfterFirmware) { return }
+        Write-Log 'SNS-3655 uses the same CIMC network, DNS, NTP, and timezone steps as a UCS node.'
+        Write-Log 'RAID and UEFI secure boot stay at the factory state. This script does not change storage or secure boot.'
+        if ($script:FirmwareEnabled) {
+            Write-Log -Level WARN 'SNS CIMC firmware must be an image qualified for that ISE release. A UCS C-Series HUU is not compatible with SNS hardware.'
+        }
+        return
+    }
+    Write-Log $(if ($AfterFirmware) {
+            'Re-applying the APIC-M4 profile. An HUU upgrade can turn TPM support off.'
+        } else {
+            'Applying the APIC-M4 CIMC profile: VIC LLDP disabled, BIOS TPM support enabled.'
+        })
+    if ($script:FirmwareEnabled -and -not $AfterFirmware) {
+        Write-Log -Level WARN 'APIC-M4 firmware must be a release Cisco supports for that APIC version. A generic UCS HUU can leave CIMC unsupported and can turn TPM off.'
+    }
+    try {
+        Disable-CimcAdapterLldp -Port $Port -TimeoutSec $cmdTO -InterDelayMs $delayMs
+        Enable-CimcTpmSupport -Port $Port -TimeoutSec $cmdTO -InterDelayMs $delayMs
+    }
+    catch {
+        Write-Log -Level WARN "APIC-M4 profile did not finish: $($_.Exception.Message)"
+        Restore-CimcCli -Port $Port | Out-Null
+    }
+    Write-Log 'APIC-M4 LLDP and TPM support are requested. They take effect the next time the host boots. TPM ownership is taken by the APIC operating system. This step does not reboot the host.'
 }
 
 function Get-CimcTimezoneSteps {
@@ -3200,8 +3494,10 @@ function Invoke-ConfigureServer {
     $dns2   = if ($Server.PSObject.Properties.Name -contains 'secondaryDns' -and $Server.secondaryDns) { $Server.secondaryDns.Trim() } else { '' }
     $domain = $Server.dnsDomain.Trim()
     $ntp    = @($Server.ntpServers | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    $role   = Get-CimcServerRole -Server $Server
 
-    Write-Log "===== Starting configuration for $hn ($ip) on $ComPort ====="
+    Write-Log "===== Starting configuration for $hn ($ip) on $ComPort role=$role ====="
+    if ($role -eq 'apic-m4') { Set-ApicCimcNicPolicy -Config $Config }
 
     if ([System.IO.Ports.SerialPort]::GetPortNames() -notcontains $ComPort) {
         throw "COM port '$ComPort' not found. Available: $([System.IO.Ports.SerialPort]::GetPortNames() -join ', ')"
@@ -3219,9 +3515,18 @@ function Invoke-ConfigureServer {
                                    -PrimaryDns $dns1 -SecondaryDns $dns2 -DnsDomain $domain
         Start-Sleep -Seconds 3
         Set-CimcNtp                -Port $script:Port -Config $Config -NtpServers $ntp
+        Invoke-CimcApplianceProfile -Port $script:Port -Config $Config -Server $Server
         if ($script:FirmwareEnabled) {
             Write-Log 'Firmware step enabled: running the HUU update.'
             Invoke-FirmwareUpgrade -SerialPort $script:Port -Config $Config -TargetIp $ip
+            if ($role -eq 'apic-m4') {
+                if (Sync-CimcPrompt -Port $script:Port -Attempts 2 -TimeoutSec 5) {
+                    Invoke-CimcApplianceProfile -Port $script:Port -Config $Config -Server $Server -AfterFirmware
+                }
+                else {
+                    Write-Log -Level WARN 'Serial CLI did not return after the upgrade. Run this host again without the firmware step so the APIC-M4 TPM and LLDP settings are applied.'
+                }
+            }
         }
         Invoke-CimcLogout          -Port $script:Port
         Write-Log "===== Finished configuration for $hn ($ip) ====="

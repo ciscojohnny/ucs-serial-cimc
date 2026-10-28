@@ -30,13 +30,21 @@ In this order:
 
 1. Log in. On a factory-default CIMC, complete the forced password change.
 2. Set NIC mode, static IPv4, DNS, hostname, and DNS domain. A hostname change
-   regenerates the CIMC certificate. The script answers that prompt.
+   regenerates the CIMC certificate. The script answers that prompt. An
+   `apic-m4` entry uses dedicated mode and redundancy `none` for this step.
 3. Enable NTP, then load up to four NTP servers and the timezone.
-4. If `firmware.enabled` is true, or you pass `-Firmware`, run the HUU upgrade.
+4. Apply `role` from that server entry. `ucs`, or no role, does nothing more.
+   `sns-3655` uses the same CIMC settings and leaves RAID and UEFI secure boot
+   at the factory state. `apic-m4` disables LLDP on each VIC and enables BIOS
+   TPM support. Those settings take effect the next time the host boots. The
+   script does not reboot the host for them, and it does not take TPM ownership.
+5. If `firmware.enabled` is true, or you pass `-Firmware`, run the HUU upgrade.
    CIMC mounts the ISO, updates and activates every component except the drives,
    then the script puts the boot drive first. If the automatic job cannot start, the script
    maps the ISO, puts the CIMC-mapped DVD first in the boot order, and power-cycles
-   the host onto that DVD.
+   the host onto that DVD. An SNS or APIC HUU must be the image Cisco qualified
+   for that appliance release, not a generic UCS HUU. After an APIC-M4 upgrade,
+   the script sets TPM support and VIC LLDP again when the serial CLI returns.
 
 `site.disableIpv6` turns IPv6 off on the management port. `site.vlanEnabled`
 tags that port. CIMC settings apply when they are committed, so the script does
@@ -98,6 +106,7 @@ values. Example minimal entry:
 ```jsonc
 {
     "hostName":      "rack02-ucs01",
+    "role":          "ucs",
     "ipAddress":     "10.10.20.61",
     "primaryDns":    "10.10.10.10",
     "secondaryDns":  "10.10.10.11",      // "" if not used
@@ -111,6 +120,16 @@ values. Example minimal entry:
 
 When you run the script with `-HostName rack02-ucs01`, that one entry is the
 one applied to the CIMC currently attached to `-ComPort`.
+
+`role` chooses the appliance profile for that one entry:
+
+| `role` | What changes |
+| --- | --- |
+| `ucs`, or omitted | Standalone UCS node. Network, DNS, NTP, timezone, and the optional HUU. |
+| `sns-3655` | The same CIMC steps. RAID and UEFI secure boot are left as shipped. A firmware run must use an ISE-qualified CIMC image. |
+| `apic-m4` | Dedicated CIMC and redundancy `none`, even if `site` says otherwise. LLDP is disabled on each VIC. BIOS TPM support is enabled. TPM ownership stays with the APIC operating system. A firmware run must use an APIC-supported image. |
+
+SNS-3655 and APIC-M4 are C220 M5 appliances. Their CIMC CLI matches the UCS node path. The extra steps above are the settings Cisco documents for those appliances.
 
 ## Running the script
 

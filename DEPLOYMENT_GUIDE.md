@@ -302,6 +302,7 @@ command line.
 
     {
         "hostName":      "rack01-ucs01",
+        "role":          "ucs",
         "ipAddress":     "10.10.20.51",
         "primaryDns":    "10.10.10.10",
         "secondaryDns":  "10.10.10.11",
@@ -326,6 +327,14 @@ command line.
 
 ]
 ```
+
+`role` is optional. Leave it as `"ucs"`, or omit it, for a standalone UCS node.
+`"sns-3655"` uses the same CIMC steps and does not change RAID or UEFI secure
+boot. `"apic-m4"` forces dedicated CIMC with redundancy `none`, disables LLDP
+on each VIC, and enables BIOS TPM support. Those APIC settings apply on the
+next host boot. The script does not reboot the host to make them active, and
+it does not take TPM ownership. An SNS or APIC firmware image must be the one
+Cisco qualified for that appliance, not a generic UCS HUU.
 
 To add another server, copy one of the blocks (everything from `{` to `}`),
 paste it below the previous one, change the values, and add a comma after the

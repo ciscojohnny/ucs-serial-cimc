@@ -18,5 +18,6 @@ When the CLI or the HUU XML disagrees, try the newer form and keep the fallback.
 - Do not send `set enabled yes` plus commit under `scope vmedia`, do not send `set low-power-usb-enabled no`, and do not run `show mappings`. `map-www` needs the space before the filename. Send a blank username, not `anonymous`.
 - An empty precision boot list is valid. Do not fail the run because `LocalLUN` is missing.
 - Do not re-add UEFI secure boot or a reboot after configuration-only.
+- `role` defaults to `ucs`. That path must not gain SNS or APIC settings. `sns-3655` keeps the UCS CIMC steps and must not change RAID or secure boot. `apic-m4` forces NIC mode `dedicated` and redundancy `none`, disables VIC LLDP, and enables BIOS TPM support. Do not clear the TPM, take TPM ownership, or change PCR banks. LLDP and TPM apply on the next host boot. Re-apply them after HUU when the serial CLI returns. SNS and APIC firmware images are appliance-qualified builds, not a generic UCS HUU.
 - The ISO server must answer HTTP 206. Log the first request and errors, not every byte range.
 - Do not commit site hostnames, IPs, domains, or session logs.

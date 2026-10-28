@@ -110,10 +110,17 @@
     //   secondaryDns  optional   "" if unused
     //   dnsDomain     required
     //   ntpServers    required   1 to 4 servers
+    //   role          optional   "ucs" (default), "sns-3655", or "apic-m4"
+    //
+    // "ucs" is a standalone C-Series node. Omit role for the same result.
+    // "sns-3655" uses that same CIMC setup. RAID and secure boot stay as shipped.
+    // "apic-m4" forces dedicated CIMC with no redundancy, disables VIC LLDP,
+    // and enables BIOS TPM support. Those two settings apply on the next host boot.
     "servers": [
 
         {
             "hostName":      "rack01-ucs01",
+            "role":          "ucs",
             "ipAddress":     "10.10.20.51",
             "primaryDns":    "10.10.10.10",
             "secondaryDns":  "10.10.10.11",
@@ -126,6 +133,7 @@
 
         {
             "hostName":      "rack01-ucs02",
+            "role":          "ucs",
             "ipAddress":     "10.10.20.52",
             "primaryDns":    "10.10.10.10",
             "secondaryDns":  "10.10.10.11",
@@ -138,6 +146,7 @@
 
         {
             "hostName":      "rack01-ucs03",
+            "role":          "ucs",
             "ipAddress":     "10.10.20.53",
             "primaryDns":    "10.10.10.10",
             "secondaryDns":  "10.10.10.11",
