@@ -1,6 +1,7 @@
 <#
 .SYNOPSIS
-    Configures a Cisco UCS C-Series CIMC over the serial console and preps it for Intersight claim.
+    Configures a Cisco UCS C-Series CIMC over the serial console. UCS nodes are prepped for
+    Intersight claim. SNS-3655 and APIC-M4 (role) do not use Intersight.
 
 .DESCRIPTION
     Edit cimc-config.jsonc, then run this script against the CIMC on -ComPort.

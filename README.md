@@ -193,6 +193,9 @@ Passwords are never written to `cimc-config.jsonc` and never appear in the log.
 
 ## Intersight claim
 
+**UCS nodes only** (`role` `ucs`, or no role). SNS-3655 and APIC-M4 appliances do
+not use Intersight, so skip this step for them.
+
 The Device Connector is already enabled. The script does not change it. To
 claim the server in Intersight, browse to the CIMC web UI at the IP you just
 configured, open **Admin → Device Connector**, and copy the Device ID and

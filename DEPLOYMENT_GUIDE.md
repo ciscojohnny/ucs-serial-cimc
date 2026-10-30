@@ -458,6 +458,9 @@ included in the error, and the full session log is saved under `logs/`.
 
 ## Step 7 — Claim the server in Intersight
 
+**UCS nodes only.** Skip this step for `role` `sns-3655` and `apic-m4`. SNS-3655
+and APIC-M4 appliances do not use Intersight, so there is nothing to claim.
+
 The script doesn't print the Intersight Claim Code — grab it from the CIMC web
 UI now that the CIMC has its new IP:
 
